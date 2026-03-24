@@ -80,7 +80,7 @@ class TestBasicRun:
         ds = _run(tmp_path, ["--n_steps", "20", "--chunk_size", "7",
                               "--save_interval", "10"])
         with ds:
-            # time records: t=0 + save at step 14 (first chunk boundary >= 10)
+            # time records: t=0 + exact saves at step 10 and step 20 = 3 total
             n_rec = ds.variables["T"].shape[0]
             assert n_rec >= 2
             assert ds.variables["T"].shape[1:] == (4, 4, 3)
@@ -103,14 +103,14 @@ class TestPartialChunk:
     def test_final_time(self, tmp_path):
         dt = 900.0
         n_steps = 13
+        # save_interval=n_steps ensures exactly one save at the final step.
         ds = _run(tmp_path, ["--n_steps", str(n_steps), "--chunk_size", "5",
-                              "--save_interval", "100", "--dt", str(dt)])
+                              "--save_interval", str(n_steps), "--dt", str(dt)])
         with ds:
             times = np.array(ds.variables["time"][:])
-        # last record is the save triggered at steps_done=13 >= save_interval=100?
-        # No — save_interval=100 > n_steps=13, so only t=0 is saved.
-        # Verify t=0 is present.
-        assert float(times[0]) == pytest.approx(0.0)
+        # records: t=0 (initial) + t=n_steps*dt (final) = 2 total
+        assert len(times) == 2
+        assert float(times[-1]) == pytest.approx(n_steps * dt)
 
     def test_completes_without_error(self, tmp_path):
         """Simply verify no exception is raised."""
@@ -125,8 +125,8 @@ class TestPartialChunk:
 class TestSaveIntervalDecoupled:
     """
     save_interval=3, chunk_size=5, n_steps=15.
-    chunk boundaries at steps 5, 10, 15; all three cross a save threshold.
-    Expected NetCDF records: t=0 (initial) + saves at steps 5, 10, 15 = 4 total.
+    Effective chunk = min(5, 3) = 3; saves at exact steps 3, 6, 9, 12, 15.
+    Expected NetCDF records: t=0 (initial) + 5 exact saves = 6 total.
     """
 
     def test_record_count(self, tmp_path):
@@ -134,7 +134,7 @@ class TestSaveIntervalDecoupled:
                               "--save_interval", "3"])
         with ds:
             n_rec = ds.variables["time"].shape[0]
-        assert n_rec == 4
+        assert n_rec == 6
 
     def test_time_values(self, tmp_path):
         dt = 900.0
@@ -142,7 +142,7 @@ class TestSaveIntervalDecoupled:
                               "--save_interval", "3", "--dt", str(dt)])
         with ds:
             times = np.array(ds.variables["time"][:])
-        expected = np.array([0.0, 5 * dt, 10 * dt, 15 * dt], dtype=np.float32)
+        expected = np.array([0, 3, 6, 9, 12, 15], dtype=np.float32) * dt
         np.testing.assert_allclose(times, expected, rtol=1e-5)
 
 

@@ -268,15 +268,10 @@ def main(argv=None) -> None:
     state  = create_rest_state(grid, T_background=args.T_bg, S_background=args.S_bg)
 
     # --- JIT-compiled scan loop ---
-    # n_steps is static: JAX caches a separate compiled trace per unique value,
-    # so full chunks and the partial final chunk compile independently.
+    # n_steps is static: JAX caches a separate compiled trace per unique value.
+    # With exact-save chunking the effective chunk size is
+    # min(chunk_size, save_interval), so at most two distinct sizes are compiled.
     run_jit = jax.jit(ocean_run, static_argnames=("n_steps", "save_history"))
-
-    # --- chunk schedule: full chunks + optional partial remainder ---
-    n_full, remainder = divmod(args.n_steps, args.chunk_size)
-    chunk_sizes = [args.chunk_size] * n_full
-    if remainder > 0:
-        chunk_sizes.append(remainder)
 
     # --- open output file and save t=0 ---
     ds = _create_output_file(args.output, grid, args)
@@ -287,9 +282,13 @@ def main(argv=None) -> None:
     next_save_step = args.save_interval
 
     try:
-        for chunk_steps in chunk_sizes:
-            t0 = _time.perf_counter()
+        while steps_done < args.n_steps:
+            steps_remaining  = args.n_steps - steps_done
+            steps_until_save = next_save_step - steps_done
+            # Cap chunk at the next save boundary so saves are exact.
+            chunk_steps = min(args.chunk_size, steps_remaining, steps_until_save)
 
+            t0 = _time.perf_counter()
             forcing_seq = _make_forcing(chunk_steps, args, grid)
             state, _ = run_jit(
                 state, grid, params,
@@ -302,16 +301,15 @@ def main(argv=None) -> None:
             wall_dt     = _time.perf_counter() - t0
             steps_done += chunk_steps
 
-            # Save at most once per chunk, but advance past all crossed thresholds.
-            if steps_done >= next_save_step:
-                _append_snapshot(ds, state)
-                while next_save_step <= steps_done:
-                    next_save_step += args.save_interval
-
+            # NaN check before writing — avoids saving a corrupted snapshot.
             has_nan = _print_diag(steps_done, args.n_steps, state, wall_dt)
             if has_nan:
                 print("ERROR: NaN detected — aborting.", file=sys.stderr)
                 sys.exit(1)
+
+            if steps_done == next_save_step:
+                _append_snapshot(ds, state)
+                next_save_step += args.save_interval
 
     finally:
         ds.close()
