@@ -218,9 +218,13 @@ def step(
 
     # ------------------------------------------------------------------
     # 3. Leapfrog momentum advance
+    #    Bootstrap (step_count == 0): use 1*dt (Forward Euler) so that
+    #    u_prev = u gives u_new = u + dt*G — the correct first step.
+    #    All subsequent steps use the standard 2*dt leapfrog.
     # ------------------------------------------------------------------
-    u_new = (state.u_prev + 2.0 * dt * G_u) * grid.mask_u
-    v_new = (state.v_prev + 2.0 * dt * G_v) * grid.mask_v
+    leapfrog_dt = jnp.where(state.step_count == 0, dt, 2.0 * dt)
+    u_new = (state.u_prev + leapfrog_dt * G_u) * grid.mask_u
+    v_new = (state.v_prev + leapfrog_dt * G_v) * grid.mask_v
 
     # ------------------------------------------------------------------
     # 4. Asselin-Robert filter on current-time-level u(n), v(n)
@@ -252,12 +256,16 @@ def step(
 
     # ------------------------------------------------------------------
     # 7. Adams-Bashforth 3 tracer advance
-    #    Coefficients from params.ab3_coeffs = (a0, a1, a2).
-    #    For the first two steps T_tend_prev and T_tend_prev2 are zero
-    #    (set in create_zero_state / create_rest_state), so the scheme
-    #    degrades gracefully: step 0 → AB1, step 1 → AB2, step 2+ → AB3.
+    #    Select coefficients based on step_count for proper bootstrap:
+    #      step_count == 0  →  AB1: (1,    0,    0  )
+    #      step_count == 1  →  AB2: (3/2, -1/2,  0  )
+    #      step_count >= 2  →  AB3: params.ab3_coeffs
     # ------------------------------------------------------------------
-    a0, a1, a2 = params.ab3_coeffs
+    ab3_0, ab3_1, ab3_2 = params.ab3_coeffs
+    sc = state.step_count
+    a0 = jnp.where(sc == 0, 1.0,       jnp.where(sc == 1,  3.0/2.0, ab3_0))
+    a1 = jnp.where(sc == 0, 0.0,       jnp.where(sc == 1, -1.0/2.0, ab3_1))
+    a2 = jnp.where(sc == 0, 0.0,       jnp.where(sc == 1,  0.0,     ab3_2))
     T_new = (state.T + dt * (a0 * G_T
                              + a1 * state.T_tend_prev
                              + a2 * state.T_tend_prev2)) * grid.mask_c
@@ -281,8 +289,11 @@ def step(
 
     # ------------------------------------------------------------------
     # 10. Diagnose w; impose kinematic BC w[0] = deta/dt
+    #    Use u_filt/v_filt — the same velocity state used for eta — so
+    #    that the surface BC and the interior continuity diagnosis are
+    #    consistent within the step.
     # ------------------------------------------------------------------
-    w_new = compute_w(u_new, v_new, grid)
+    w_new = compute_w(u_filt, v_filt, grid)
     # Set the surface face to the kinematic signal; mask_w gates it.
     w_new = w_new.at[:, :, 0].set(deta_dt * grid.mask_w[:, :, 0])
 
@@ -304,7 +315,8 @@ def step(
         S_tend_prev  = G_S,
         T_tend_prev2 = state.T_tend_prev,
         S_tend_prev2 = state.S_tend_prev,
-        time = state.time + dt,
+        time       = state.time + dt,
+        step_count = state.step_count + 1,
     )
 
 

@@ -105,7 +105,9 @@ class OceanState(eqx.Module):
         S_tend_prev2           - S tendency at time n-2
 
     Scalar:
-        time [s]
+        time      [s]
+        step_count  number of steps taken (int32); used to select AB1/AB2/AB3
+                    bootstrap coefficients in the first two steps.
     """
     u: jnp.ndarray           # (Nx, Ny, Nz)
     v: jnp.ndarray           # (Nx, Ny, Nz)
@@ -124,7 +126,8 @@ class OceanState(eqx.Module):
     T_tend_prev2: jnp.ndarray   # (Nx, Ny, Nz)
     S_tend_prev2: jnp.ndarray   # (Nx, Ny, Nz)
 
-    time: jnp.ndarray        # scalar float32
+    time:       jnp.ndarray  # scalar float32
+    step_count: jnp.ndarray  # scalar int32
 
     # ------------------------------------------------------------------
     # apply_masks
@@ -144,7 +147,8 @@ class OceanState(eqx.Module):
             S_tend_prev  = self.S_tend_prev  * grid.mask_c,
             T_tend_prev2 = self.T_tend_prev2 * grid.mask_c,
             S_tend_prev2 = self.S_tend_prev2 * grid.mask_c,
-            time = self.time,
+            time       = self.time,
+            step_count = self.step_count,
         )
 
 
@@ -168,7 +172,8 @@ def create_zero_state(grid: OceanGrid) -> OceanState:
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
-        time = jnp.array(0.0, dtype=jnp.float32),
+        time       = jnp.array(0.0, dtype=jnp.float32),
+        step_count = jnp.array(0,   dtype=jnp.int32),
     )
 
 
@@ -203,7 +208,7 @@ def create_from_arrays(
     else:
         w = jnp.asarray(w, dtype=jnp.float32)
 
-    return OceanState(
+    state = OceanState(
         u=u, v=v, w=w, T=T, S=S, eta=eta,
         u_prev=u.copy(),
         v_prev=v.copy(),
@@ -211,8 +216,10 @@ def create_from_arrays(
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
-        time=jnp.array(time, dtype=jnp.float32),
+        time       = jnp.array(time, dtype=jnp.float32),
+        step_count = jnp.array(0,    dtype=jnp.int32),
     )
+    return state.apply_masks(grid)
 
 
 def create_rest_state(
@@ -241,5 +248,6 @@ def create_rest_state(
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
-        time=jnp.array(0.0, dtype=jnp.float32),
+        time       = jnp.array(0.0, dtype=jnp.float32),
+        step_count = jnp.array(0,   dtype=jnp.int32),
     )
