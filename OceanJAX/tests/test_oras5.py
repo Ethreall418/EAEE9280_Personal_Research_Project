@@ -362,6 +362,58 @@ class TestRegridToModel:
             "Non-zero T values in land cells after regridding"
         )
 
+    def test_no_coastal_contamination(self, tmp_path):
+        """
+        NaN-aware fill must not bleed fill_value into coast-adjacent ocean cells.
+
+        Setup: all source T values are 10.0 except one coastal column (i=0)
+        which is entirely NaN (land).  A large fill_value=999 is passed.
+        The target grid sits well inside the ocean region (lon >= 1.0) so
+        none of its cells should receive a value blended with 999.
+        With the old fill-then-interpolate approach, coast-adjacent target
+        points would come out ≈ (10*w + 999*(1-w)) >> 10.  With normalised
+        convolution the answer should be ≈ 10.
+        """
+        nan_mask = np.zeros((_NZ_SRC, _NY_SRC, _NX_SRC), dtype=bool)
+        nan_mask[:, :, 0] = True    # entire western column is NaN / land
+
+        nc = tmp_path / "coastal.nc"
+        _write_nc(nc, nan_mask=nan_mask)
+        grid = _target_grid()   # lon in [1, 3], safely away from lon=0 coast
+
+        state = regrid_to_model(read_oras5(nc), grid, T_fill=999.0)
+        T = np.array(state.T)
+        ocean = np.array(grid.mask_c, dtype=bool)
+
+        # All ocean cells should be close to real ocean values (10–20 °C),
+        # NOT contaminated by the fill_value of 999.
+        assert np.all(T[ocean] < 50.0), (
+            f"Coastal contamination detected: max T = {T[ocean].max():.1f} "
+            "(expected ≈ 10–20, fill=999)"
+        )
+
+    def test_uv_zero_below_source_depth(self, tmp_path):
+        """u and v must be exactly zero at target levels below src_depth.max()."""
+        nc = tmp_path / "deep_uv.nc"
+        _write_nc(nc, u_name="uo", v_name="vo", eta_name="zos")
+
+        # Target grid with a level (300 m) deeper than _SRC_DEPTH.max() = 200 m
+        depth_levels = np.array([15.0, 300.0], dtype=np.float64)
+        grid = OceanGrid.create(
+            lon_bounds=(1.0, 3.0),
+            lat_bounds=(11.0, 14.0),
+            depth_levels=depth_levels,
+            Nx=3,
+            Ny=4,
+        )
+        state = regrid_to_model(read_oras5(nc), grid)
+        u = np.array(state.u)
+        v = np.array(state.v)
+
+        # k=1 corresponds to 300 m, which is below the source max of 200 m
+        assert np.allclose(u[:, :, 1], 0.0), "u at 300 m (below src) should be zero"
+        assert np.allclose(v[:, :, 1], 0.0), "v at 300 m (below src) should be zero"
+
     def test_load_oras5_wrapper(self, tmp_path):
         """load_oras5 convenience wrapper produces same result as two-layer call."""
         nc = tmp_path / "wrap.nc"

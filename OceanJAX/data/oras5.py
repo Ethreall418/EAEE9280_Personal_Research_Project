@@ -31,12 +31,21 @@ ORAS5 source resolution is ~0.25°.  Regridding onto a *finer* target grid
 invents spurious fine-scale structure; a ``UserWarning`` is issued but
 execution is not blocked.
 
-Missing-value strategy (three-tier)
-------------------------------------
-1. Linear 3-D ``RegularGridInterpolator`` — covers the common case.
-2. Nearest-neighbour pass for any remaining NaN (out-of-domain target
-   points, or deep levels below ORAS5 bathymetry).
-3. Constant ``T_fill`` / ``S_fill`` / ``0`` as an unconditional fallback.
+Missing-value strategy (three-tier, NaN-aware)
+-----------------------------------------------
+1. Normalised convolution — data and validity mask are interpolated
+   separately (data_sum / mask_sum), so coast-adjacent ocean points
+   are never contaminated by fill values.
+2. ``NearestNDInterpolator`` on valid source points only — fills any
+   target point whose entire linear stencil is NaN (e.g. isolated
+   deep cells below the bathymetry).
+3. Constant ``T_fill`` / ``S_fill`` / ``0`` as unconditional fallback.
+
+Vertical extrapolation
+-----------------------
+  T, S — nearest valid source level (handled automatically by tier 2).
+  u, v — explicitly zeroed below the deepest ORAS5 level (extrapolating
+          bottom velocities downward is physically wrong).
 """
 
 from __future__ import annotations
@@ -47,7 +56,7 @@ import warnings
 
 import numpy as np
 import xarray as xr
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator, NearestNDInterpolator
 
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import OceanState, create_from_arrays
@@ -221,6 +230,83 @@ def read_oras5(
 # Private: interpolation helpers
 # ---------------------------------------------------------------------------
 
+def _normalized_conv_3d(
+    src:       np.ndarray,   # (Nz, Ny, Nx), may contain NaN
+    src_depth: np.ndarray,
+    src_lat:   np.ndarray,
+    src_lon:   np.ndarray,
+    tgt_depth: np.ndarray,
+    tgt_lat:   np.ndarray,
+    tgt_lon:   np.ndarray,
+) -> np.ndarray:
+    """
+    NaN-aware linear interpolation via normalised convolution.
+
+    Instead of replacing NaN with fill_value (which contaminates coast-adjacent
+    ocean points), we interpolate the data and the validity mask separately:
+
+        data_sum  = RGI_linear(NaN → 0)
+        mask_sum  = RGI_linear(valid=1, NaN=0)
+        out       = data_sum / mask_sum   where mask_sum > eps
+
+    Points where mask_sum ≤ eps receive NaN and are handled by the caller.
+    """
+    valid      = (~np.isnan(src)).astype(np.float64)
+    src_filled = np.where(np.isnan(src), 0.0, src).astype(np.float64)
+
+    dz, dy, dx = np.meshgrid(tgt_depth, tgt_lat, tgt_lon, indexing="ij")
+    pts = np.stack([dz.ravel(), dy.ravel(), dx.ravel()], axis=-1)
+    out_shape  = (len(tgt_depth), len(tgt_lat), len(tgt_lon))
+
+    rgi_data = RegularGridInterpolator(
+        (src_depth, src_lat, src_lon), src_filled,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+    rgi_mask = RegularGridInterpolator(
+        (src_depth, src_lat, src_lon), valid,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+
+    data_sum = rgi_data(pts).reshape(out_shape)
+    mask_sum = rgi_mask(pts).reshape(out_shape)
+
+    eps = 1e-6
+    out = np.where(mask_sum > eps, data_sum / np.maximum(mask_sum, eps), np.nan)
+    return out
+
+
+def _normalized_conv_2d(
+    src:     np.ndarray,   # (Ny, Nx), may contain NaN
+    src_lat: np.ndarray,
+    src_lon: np.ndarray,
+    tgt_lat: np.ndarray,
+    tgt_lon: np.ndarray,
+) -> np.ndarray:
+    """2-D version of ``_normalized_conv_3d``."""
+    valid      = (~np.isnan(src)).astype(np.float64)
+    src_filled = np.where(np.isnan(src), 0.0, src).astype(np.float64)
+
+    dy, dx = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+    pts = np.stack([dy.ravel(), dx.ravel()], axis=-1)
+    out_shape = (len(tgt_lat), len(tgt_lon))
+
+    rgi_data = RegularGridInterpolator(
+        (src_lat, src_lon), src_filled,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+    rgi_mask = RegularGridInterpolator(
+        (src_lat, src_lon), valid,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+
+    data_sum = rgi_data(pts).reshape(out_shape)
+    mask_sum = rgi_mask(pts).reshape(out_shape)
+
+    eps = 1e-6
+    out = np.where(mask_sum > eps, data_sum / np.maximum(mask_sum, eps), np.nan)
+    return out
+
+
 def _interp_3d(
     src:        np.ndarray,
     src_lon:    np.ndarray,
@@ -234,33 +320,46 @@ def _interp_3d(
     """
     Interpolate ``(Nz_src, Ny_src, Nx_src)`` → ``(Nz_tgt, Ny_tgt, Nx_tgt)``.
 
-    NaN (land/fill) cells in the source are replaced with ``fill_value``
-    before building the interpolator.  Near-coast contamination (linear
-    blending of ocean values with fill_value) is acceptable at ≥ 0.25°
-    resolution and is zeroed out by ``apply_masks`` for any land target cell.
-
-    Three-tier strategy (see module docstring).
+    Three-tier NaN strategy:
+    1. Normalised convolution (NaN-aware linear) — no coastal contamination.
+    2. Per-level ``NearestNDInterpolator`` on valid source points only —
+       fills points where the local linear stencil is entirely NaN.
+    3. Constant ``fill_value`` as final fallback.
     """
-    src_clean = np.where(np.isnan(src), fill_value, src)
-
-    dz, dy, dx = np.meshgrid(tgt_depth, tgt_lat, tgt_lon, indexing="ij")
-    pts = np.stack([dz.ravel(), dy.ravel(), dx.ravel()], axis=-1)
-    out_shape = (len(tgt_depth), len(tgt_lat), len(tgt_lon))
-
-    rgi_lin = RegularGridInterpolator(
-        (src_depth, src_lat, src_lon), src_clean,
-        method="linear", bounds_error=False, fill_value=np.nan,
+    out = _normalized_conv_3d(
+        src, src_depth, src_lat, src_lon,
+        tgt_depth, tgt_lat, tgt_lon,
     )
-    out = rgi_lin(pts).reshape(out_shape)
 
     needs_nn = np.isnan(out)
     if np.any(needs_nn):
-        rgi_nn = RegularGridInterpolator(
-            (src_depth, src_lat, src_lon), src_clean,
-            method="nearest", bounds_error=False, fill_value=np.nan,
+        # Per-level nearest-ocean-neighbour on valid source points only
+        dz_src, dy_src, dx_src = np.meshgrid(
+            src_depth, src_lat, src_lon, indexing="ij"
         )
-        out_nn = rgi_nn(pts).reshape(out_shape)
-        out = np.where(needs_nn, out_nn, out)
+        valid_mask = ~np.isnan(src)
+
+        dz, dy, dx = np.meshgrid(tgt_depth, tgt_lat, tgt_lon, indexing="ij")
+        nn_fill = np.empty_like(out)
+        for k in range(len(tgt_depth)):
+            # Collect valid source points across all depths for this output level
+            pts_valid = np.stack([
+                dz_src[valid_mask].ravel(),
+                dy_src[valid_mask].ravel(),
+                dx_src[valid_mask].ravel(),
+            ], axis=-1)
+            vals_valid = src[valid_mask].ravel()
+            if len(vals_valid) == 0:
+                nn_fill[k] = fill_value
+            else:
+                interp_nn = NearestNDInterpolator(pts_valid, vals_valid)
+                tgt_pts_k = np.stack([
+                    dz[k].ravel(), dy[k].ravel(), dx[k].ravel()
+                ], axis=-1)
+                nn_fill[k] = interp_nn(tgt_pts_k).reshape(
+                    len(tgt_lat), len(tgt_lon)
+                )
+        out = np.where(needs_nn, nn_fill, out)
 
     still_nan = np.isnan(out)
     if np.any(still_nan):
@@ -281,25 +380,24 @@ def _interp_2d(
     Interpolate ``(Ny_src, Nx_src)`` → ``(Ny_tgt, Nx_tgt)``.
     Same three-tier NaN strategy as ``_interp_3d``.
     """
-    src_clean = np.where(np.isnan(src), fill_value, src)
-    dy, dx = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
-    pts = np.stack([dy.ravel(), dx.ravel()], axis=-1)
-    out_shape = (len(tgt_lat), len(tgt_lon))
-
-    rgi_lin = RegularGridInterpolator(
-        (src_lat, src_lon), src_clean,
-        method="linear", bounds_error=False, fill_value=np.nan,
-    )
-    out = rgi_lin(pts).reshape(out_shape)
+    out = _normalized_conv_2d(src, src_lat, src_lon, tgt_lat, tgt_lon)
 
     needs_nn = np.isnan(out)
     if np.any(needs_nn):
-        rgi_nn = RegularGridInterpolator(
-            (src_lat, src_lon), src_clean,
-            method="nearest", bounds_error=False, fill_value=np.nan,
-        )
-        out_nn = rgi_nn(pts).reshape(out_shape)
-        out = np.where(needs_nn, out_nn, out)
+        dy_src, dx_src = np.meshgrid(src_lat, src_lon, indexing="ij")
+        valid_mask = ~np.isnan(src)
+        pts_valid  = np.stack([dy_src[valid_mask].ravel(),
+                               dx_src[valid_mask].ravel()], axis=-1)
+        vals_valid = src[valid_mask].ravel()
+
+        if len(vals_valid) == 0:
+            out = np.where(needs_nn, fill_value, out)
+        else:
+            interp_nn  = NearestNDInterpolator(pts_valid, vals_valid)
+            dy, dx = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+            tgt_pts = np.stack([dy.ravel(), dx.ravel()], axis=-1)
+            nn_fill = interp_nn(tgt_pts).reshape(len(tgt_lat), len(tgt_lon))
+            out = np.where(needs_nn, nn_fill, out)
 
     still_nan = np.isnan(out)
     if np.any(still_nan):
@@ -397,12 +495,19 @@ def regrid_to_model(
     T_zyx = _interp_3d(raw["T"], **kw3, fill_value=T_fill)
     S_zyx = _interp_3d(raw["S"], **kw3, fill_value=S_fill)
 
-    u_zyx   = (_interp_3d(raw["u"],   **kw3, fill_value=0.0)
-               if raw["u"]   is not None
-               else np.zeros((Nz, Ny, Nx), dtype=np.float32))
-    v_zyx   = (_interp_3d(raw["v"],   **kw3, fill_value=0.0)
-               if raw["v"]   is not None
-               else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+    if raw["u"] is not None:
+        u_zyx = _interp_3d(raw["u"], **kw3, fill_value=0.0)
+        v_zyx = _interp_3d(raw["v"], **kw3, fill_value=0.0)
+        # Zero out levels that lie below the deepest ORAS5 level.
+        # Nearest-neighbour would otherwise extrapolate bottom velocities
+        # indefinitely downward, which is physically wrong.
+        below_src = tgt_depth > src_depth.max()
+        if np.any(below_src):
+            u_zyx[below_src] = 0.0
+            v_zyx[below_src] = 0.0
+    else:
+        u_zyx = np.zeros((Nz, Ny, Nx), dtype=np.float32)
+        v_zyx = np.zeros((Nz, Ny, Nx), dtype=np.float32)
     eta_yx  = (_interp_2d(raw["eta"], **kw2, fill_value=0.0)
                if raw["eta"] is not None
                else np.zeros((Ny, Nx), dtype=np.float32))
