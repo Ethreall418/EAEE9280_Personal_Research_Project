@@ -78,11 +78,17 @@ from OceanJAX.state import OceanState, create_from_arrays
 # ---------------------------------------------------------------------------
 
 _VAR_ALIASES: dict[str, list[str]] = {
-    "T":   ["thetao", "thetao_oras", "votemper", "temperature"],
-    "S":   ["so",     "so_oras",     "vosaline",  "salinity"],
-    "u":   ["uo",     "uo_oras",     "vozocrtx",  "u"],
-    "v":   ["vo",     "vo_oras",     "vomecrty",  "v"],
-    "eta": ["zos",    "zos_oras",    "sossheig",  "ssh"],
+    # Ocean state
+    "T":        ["thetao", "thetao_oras", "votemper", "temperature"],
+    "S":        ["so",     "so_oras",     "vosaline",  "salinity"],
+    "u":        ["uo",     "uo_oras",     "vozocrtx",  "u"],
+    "v":        ["vo",     "vo_oras",     "vomecrty",  "v"],
+    "eta":      ["zos",    "zos_oras",    "sossheig",  "ssh"],
+    # Surface forcing (2-D, no depth axis)
+    "heat_flux": ["sohefldo", "qnet", "netheatflux", "hfds"],
+    "fw_flux":   ["sowaflup", "wfo",  "freshwaterflux", "emp"],
+    "tau_x":     ["sozotaux", "tauuo", "utau", "tauu"],
+    "tau_y":     ["sometauy", "tauvo", "vtau", "tauv"],
 }
 
 _COORD_ALIASES: dict[str, list[str]] = {
@@ -947,4 +953,161 @@ def load_oras5(
         grid,
         T_fill=T_fill,
         S_fill=S_fill,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public: read_oras5_forcing
+# ---------------------------------------------------------------------------
+
+#: All surface-forcing field keys recognised by :func:`read_oras5_forcing`.
+FORCING_FIELDS: frozenset[str] = frozenset({"heat_flux", "fw_flux", "tau_x", "tau_y"})
+
+
+def read_oras5_forcing(
+    path:       str | Path,
+    time_index: int = 0,
+) -> dict[str, Optional[np.ndarray]]:
+    """
+    Read surface-forcing fields from an ORAS5 (or ERA5 / NEMO-flux) NetCDF file.
+
+    All four forcing fields are optional.  If a variable is absent from the
+    file its key is set to ``None`` rather than raising an error — the caller
+    can decide how to handle missing fields.
+
+    Parameters
+    ----------
+    path       : NetCDF file that may contain any subset of the four forcing
+                 variables (see :data:`FORCING_FIELDS`).
+    time_index : Index along the time dimension to read (default 0).
+
+    Returns
+    -------
+    dict with keys ``"heat_flux"``, ``"fw_flux"``, ``"tau_x"``, ``"tau_y"``
+    (each a ``(Ny_src, Nx_src)`` float32 array or ``None``), plus the
+    horizontal coordinate keys ``"lon"`` and ``"lat"``.
+
+    Sign conventions
+    ----------------
+    ``heat_flux`` : positive = net downward into the ocean  [W m-2]
+    ``fw_flux``   : positive = net evaporation (E - P)      [m s-1]
+    ``tau_x``     : positive = eastward                     [N m-2]
+    ``tau_y``     : positive = northward                    [N m-2]
+
+    Notes
+    -----
+    ``sohefldo`` in ORAS5 is defined as positive-downward, consistent with the
+    model convention.  ``sowaflup`` is positive upward (evaporation > 0), also
+    consistent.  Wind-stress sign conventions vary by product — check the
+    source file metadata if in doubt.
+    """
+    ds = xr.open_dataset(path, mask_and_scale=True)
+    try:
+        lon_name = _find_coord(ds, "lon")
+        lat_name = _find_coord(ds, "lat")
+
+        lon = np.asarray(ds[lon_name].values, dtype=np.float64)
+        lat = np.asarray(ds[lat_name].values, dtype=np.float64)
+
+        result: dict[str, Optional[np.ndarray]] = {"lon": lon, "lat": lat}
+
+        for key in ("heat_flux", "fw_flux", "tau_x", "tau_y"):
+            vname = _find_var(ds, key, optional=True)
+            if vname is None:
+                result[key] = None
+                continue
+
+            da = ds[vname]
+            # Slice time dimension if present
+            time_dims = [d for d in da.dims
+                         if d in {"time", "time_counter", "t"}]
+            if time_dims:
+                da = da.isel({time_dims[0]: time_index})
+
+            arr = np.asarray(da.values, dtype=np.float32)
+            # Replace fill values / masked values with NaN
+            arr = np.where(np.isfinite(arr), arr, np.nan)
+            result[key] = arr
+
+    finally:
+        ds.close()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public: regrid_forcing
+# ---------------------------------------------------------------------------
+
+def regrid_forcing(
+    raw_forcing: dict[str, Optional[np.ndarray]],
+    grid:        OceanGrid,
+    use_fields:  set[str] | frozenset[str] = FORCING_FIELDS,
+) -> "SurfaceForcing":
+    """
+    Interpolate surface-forcing fields onto the OceanJAX model grid.
+
+    Parameters
+    ----------
+    raw_forcing : dict returned by :func:`read_oras5_forcing`.
+    grid        : Target OceanGrid.
+    use_fields  : Which forcing fields to interpolate.  Fields not in this
+                  set, or absent from ``raw_forcing``, are set to zero.
+                  Defaults to all four: ``{"heat_flux", "fw_flux", "tau_x", "tau_y"}``.
+
+    Returns
+    -------
+    :class:`~OceanJAX.timeStepping.SurfaceForcing` with shape ``(Nx, Ny)``
+    per field, ready to broadcast into a ``forcing_sequence``.
+    """
+    from OceanJAX.timeStepping import SurfaceForcing
+    import jax.numpy as jnp
+
+    src_lon = raw_forcing["lon"]
+    src_lat = raw_forcing["lat"]
+    tgt_lon = np.asarray(grid.lon_c)
+    tgt_lat = np.asarray(grid.lat_c)
+
+    tgt_lon_adj = _unify_lon(
+        src_lon if src_lon.ndim == 1 else src_lon.ravel(), tgt_lon
+    )
+
+    curvilinear = src_lat.ndim == 2
+    Ny = len(tgt_lat)
+    Nx = len(tgt_lon)
+
+    def _regrid_field(arr: np.ndarray) -> np.ndarray:
+        """Regrid one (Ny_src, Nx_src) forcing field → (Nx, Ny) model grid."""
+        if curvilinear:
+            yx = _interp_curvilinear_2d(
+                arr,
+                src_lat2d=src_lat, src_lon2d=src_lon,
+                tgt_lon=tgt_lon_adj, tgt_lat=tgt_lat,
+                fill_value=0.0,
+            )
+        else:
+            yx = _interp_2d(
+                arr,
+                src_lon=src_lon, src_lat=src_lat,
+                tgt_lon=tgt_lon_adj, tgt_lat=tgt_lat,
+                fill_value=0.0,
+            )
+        # (Ny, Nx) → (Nx, Ny)
+        return yx.T.astype(np.float32)
+
+    zeros = np.zeros((Nx, Ny), dtype=np.float32)
+
+    def _get(key: str) -> np.ndarray:
+        if key not in use_fields:
+            return zeros
+        arr = raw_forcing.get(key)
+        if arr is None:
+            return zeros
+        return _regrid_field(arr)
+
+    return SurfaceForcing(
+        heat_flux = jnp.asarray(_get("heat_flux")),
+        fw_flux   = jnp.asarray(_get("fw_flux")),
+        tau_x     = jnp.asarray(_get("tau_x")),
+        tau_y     = jnp.asarray(_get("tau_y")),
     )
