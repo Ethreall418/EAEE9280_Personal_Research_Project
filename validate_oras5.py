@@ -47,8 +47,8 @@ NX, NY, NZ = 20, 15, 10
 # Integration parameters
 # dt=300s keeps barotropic CFL = sqrt(g*DEPTH_MAX)*2*dt/dx << 1
 DT         = 300.0   # s
-N_STEPS    = 288     # 24 h  (288 × 300 s = 86400 s)
-CHUNK_SIZE = 72      # 6-h chunks
+N_STEPS    = 2016    # 7 days  (2016 × 300 s = 604800 s)
+CHUNK_SIZE = 288     # 1-day chunks
 OUTPUT_NC  = "validate_oras5_output.nc"
 
 

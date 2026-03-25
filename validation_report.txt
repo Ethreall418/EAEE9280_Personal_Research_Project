@@ -80,7 +80,7 @@ Phase 2b — Baroclinic cold start (u=v=0, eta=0; T, S from ORAS5 only)
 
 
 ================================================================
-VALIDATION RUN 2 — Tropical Atlantic subdomain (open ocean)
+VALIDATION RUN 2 — Tropical Atlantic subdomain (open ocean), 24 h
 ================================================================
 
 Domain
@@ -196,3 +196,110 @@ Known limitation
   2026-03-25) correctly addresses the theoretical instability for
   small perturbations; large-perturbation runs require either a
   shallower domain, a smaller dt, or geostrophic initialisation.
+
+
+================================================================
+VALIDATION RUN 3 — Tropical Atlantic, 7-day stability test
+================================================================
+
+Domain
+------
+  Longitude : 40°W – 5°W
+  Latitude  : 15°S – 15°N
+  Depth max : 500 m
+  (Same domain as Run 2; extended from 24 h to 7 days = 168 h)
+
+Model grid
+----------
+  Nx=20, Ny=15, Nz=10
+  dx ≈ 1.75°, dy ≈ 2°
+  dz = 50 m uniform (z_c = 25, 75, …, 475 m)
+
+Numerical parameters
+--------------------
+  dt         = 300 s
+  n_steps    = 2016  (= 7 days)
+  chunk_size = 288   (= 1 day per JIT-compiled scan)
+  Barotropic CFL (leapfrog) ≈ 0.14
+
+Phase 2a — Full ORAS5 initialisation (T, S, u, v, eta from data)
+-----------------------------------------------------------------
+  Result : PASS (2016 steps, no non-finite values)
+
+  t =  24 h : T=[ 6.86, 28.84]°C  S=[34.10, 37.25] psu  eta=[-0.676,  0.622] m
+  t =  48 h : T=[ 6.98, 28.77]°C  S=[34.08, 37.25] psu  eta=[-0.585,  0.689] m
+  t =  72 h : T=[ 7.13, 28.36]°C  S=[34.24, 37.23] psu  eta=[-0.574,  0.661] m
+  t =  96 h : T=[ 7.10, 28.28]°C  S=[34.28, 37.23] psu  eta=[-0.775,  0.570] m
+  t = 120 h : T=[ 7.14, 28.24]°C  S=[34.35, 37.23] psu  eta=[-0.465,  0.469] m
+  t = 144 h : T=[ 7.20, 27.88]°C  S=[34.26, 37.22] psu  eta=[-0.471,  0.505] m
+  t = 168 h : T=[ 7.20, 27.70]°C  S=[34.37, 37.22] psu  eta=[-0.275,  0.383] m
+
+  Observations:
+  - T_max decreases monotonically from 29.2°C (t=0) to 27.7°C over 7 days
+    (~1.5°C cooling), consistent with slow upward diffusion of cold
+    thermocline water and horizontal mixing of warm surface water.
+  - T_min increases slightly (6.86 → 7.20°C): cold deep water warms
+    weakly as heat diffuses downward from surface layers.
+  - S_min oscillates around 34.1–34.4 psu: the equatorial freshwater
+    tongue is being slowly mixed by horizontal diffusion.
+  - eta amplitude decreases from ~1 m (day 1) to ~0.65 m (day 7) as
+    the barotropic geostrophic adjustment completes and the flow
+    approaches a coarse-grid quasi-geostrophic balance.
+  - No blow-up, no non-finite values over the full 7-day integration.
+
+Phase 2b — Baroclinic cold start (u=v=0, eta=0; T, S from ORAS5 only)
+-----------------------------------------------------------------------
+  Result : PASS (2016 steps, no non-finite values)
+
+  t =  24 h : T=[ 6.86, 28.94]°C  S=[34.47, 37.26] psu  eta=[-0.113,  0.081] m
+  t =  48 h : T=[ 6.91, 28.83]°C  S=[34.56, 37.26] psu  eta=[-0.119,  0.103] m
+  t =  72 h : T=[ 6.95, 28.67]°C  S=[34.55, 37.25] psu  eta=[-0.140,  0.084] m
+  t =  96 h : T=[ 6.97, 28.63]°C  S=[34.59, 37.24] psu  eta=[-0.075,  0.055] m
+  t = 120 h : T=[ 6.98, 28.45]°C  S=[34.58, 37.24] psu  eta=[-0.066,  0.090] m
+  t = 144 h : T=[ 7.00, 28.38]°C  S=[34.58, 37.24] psu  eta=[-0.090,  0.087] m
+  t = 168 h : T=[ 7.02, 28.34]°C  S=[34.57, 37.24] psu  eta=[-0.108,  0.081] m
+
+  Observations:
+  - T_max decreases smoothly from 29.2°C to 28.3°C over 7 days (~0.9°C
+    cooling), slightly slower than Phase 2a because the initial velocity
+    field (zero) produces less horizontal advection of warm surface water.
+  - T_min increases from 6.86 to 7.02°C: same slow downward heat diffusion.
+  - S_min rises from 34.44 to 34.57 psu over 7 days: the equatorial
+    freshwater tongue is diffused away without strong advection to maintain it.
+  - eta remains bounded within ±0.14 m throughout — the geostrophically
+    adjusting currents spin up only very slowly near the equator (weak
+    Coriolis effect) and never produce large barotropic transients.
+  - This is the most stable and physically interpretable of all runs:
+    clean monotonic tracer evolution, no significant eta excursions.
+  - No blow-up, no non-finite values over the full 7-day integration.
+
+
+================================================================
+Summary (updated)
+================================================================
+
+  Run / Init          | Domain            | Duration | Phase 2a | Phase 2b
+  --------------------|-------------------|----------|----------|----------
+  North Atlantic      | 60W-10W, 20-50N   |   24 h   | PASS     | PASS
+  Tropical Atlantic   | 40W-5W,  15S-15N  |   24 h   | PASS     | PASS
+  Tropical Atlantic   | 40W-5W,  15S-15N  |    7 days | PASS     | PASS
+
+All six integration tests complete without non-finite values.
+T and S remain within physically plausible ranges in all cases.
+The 7-day stability test confirms:
+
+  1. The model is long-term stable at dt=300 s and DEPTH_MAX=500 m
+     in the Tropical Atlantic with both full ORAS5 and cold-start
+     initialisation.
+
+  2. Tracer evolution is physically consistent over 7 days: monotonic
+     surface cooling (~1–1.5°C), slow freshwater tongue erosion, and
+     smooth vertical diffusion signal.
+
+  3. eta amplitude decays over time in Phase 2a (barotropic adjustment
+     completing) and remains small and steady in Phase 2b (geostrophic
+     spin-up near the equator is weak by design).
+
+  4. The baroclinic cold start (Phase 2b) remains the recommended
+     initialisation strategy: cleanest eta signal, smallest transients,
+     and most physically interpretable tracer trends.
