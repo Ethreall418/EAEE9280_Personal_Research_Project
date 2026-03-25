@@ -200,27 +200,27 @@ class TestReadOras5:
 
         np.testing.assert_allclose(raw_asc["T"], raw_desc["T"], atol=1e-5)
 
-    def test_2d_coords_raises(self, tmp_path):
-        """2-D coordinate arrays (curvilinear grid) must raise ValueError."""
-        nc = tmp_path / "curv.nc"
-        # Write a file with 2-D lon/lat coords
-        lon2d = np.tile(_SRC_LON, (_NY_SRC, 1))
-        lat2d = np.tile(_SRC_LAT[:, np.newaxis], (1, _NX_SRC))
+    def test_2d_latlon_accepted(self, tmp_path):
+        """2-D nav_lat/nav_lon (NEMO curvilinear) must NOT raise — they are accepted."""
+        nc = tmp_path / "curv_ok.nc"
+        lon2d = np.tile(_SRC_LON, (_NY_SRC, 1)).astype(np.float64)
+        lat2d = np.tile(_SRC_LAT[:, np.newaxis], (1, _NX_SRC)).astype(np.float64)
         T_data = _make_T()[np.newaxis]
-
         ds = xr.Dataset(
-            {"thetao": (("time", "depth", "y", "x"), T_data),
-             "so":     (("time", "depth", "y", "x"), T_data)},
+            {"thetao": (("time_counter", "deptht", "y", "x"), T_data),
+             "so":     (("time_counter", "deptht", "y", "x"), T_data)},
             coords={
-                "lon":   (("y", "x"), lon2d),
-                "lat":   (("y", "x"), lat2d),
-                "depth": ("depth",   _SRC_DEPTH),
-                "time":  ("time",    [0.0]),
+                "nav_lon":  (("y", "x"), lon2d),
+                "nav_lat":  (("y", "x"), lat2d),
+                "deptht":   ("deptht",   _SRC_DEPTH),
+                "time_counter": ("time_counter", [0.0]),
             },
         )
         ds.to_netcdf(nc)
-        with pytest.raises(ValueError, match="1-D"):
-            read_oras5(nc)
+        raw = read_oras5(nc)   # must not raise
+        assert raw["lat"].ndim == 2
+        assert raw["lon"].ndim == 2
+        assert raw["T"].shape == (_NZ_SRC, _NY_SRC, _NX_SRC)
 
     def test_missing_required_raises(self, tmp_path):
         """File with no T-like variable must raise KeyError."""
@@ -239,11 +239,14 @@ class TestReadOras5:
             read_oras5(nc)
 
     def test_return_keys_always_present(self, tmp_path):
-        """All eight dict keys are present regardless of which vars exist."""
+        """All fourteen dict keys are present regardless of which vars exist."""
         nc = tmp_path / "keys.nc"
         _write_nc(nc)
         raw = read_oras5(nc)
-        for key in ("T", "S", "u", "v", "eta", "lon", "lat", "depth"):
+        for key in ("T", "S", "u", "v", "eta",
+                    "lon", "lat", "depth",
+                    "depth_u", "depth_v",
+                    "lon_u", "lat_u", "lon_v", "lat_v"):
             assert key in raw, f"Key '{key}' missing from read_oras5 output"
 
     def test_coordinate_shapes(self, tmp_path):
@@ -441,3 +444,302 @@ class TestRegridToModel:
 
         np.testing.assert_allclose(np.array(state_wrap.T), np.array(state_direct.T))
         np.testing.assert_allclose(np.array(state_wrap.S), np.array(state_direct.S))
+
+
+# ---------------------------------------------------------------------------
+# TestCurvilinearFormat  — NEMO/ORCA-style inputs
+# ---------------------------------------------------------------------------
+
+def _write_nemo_nc(
+    path,
+    u_name: str | None = None,
+    v_name: str | None = None,
+    eta_name: str | None = None,
+) -> None:
+    """Write a minimal NEMO/ORCA-style NetCDF (2-D nav_lat/nav_lon, time_counter)."""
+    lon2d = np.tile(_SRC_LON, (_NY_SRC, 1)).astype(np.float64)
+    lat2d = np.tile(_SRC_LAT[:, np.newaxis], (1, _NX_SRC)).astype(np.float64)
+
+    T = _make_T()[np.newaxis]           # (1, Nz, Ny, Nx)
+    S = _make_S()[np.newaxis]
+    uv = np.zeros_like(T)
+    eta_data = np.zeros((1, _NY_SRC, _NX_SRC), dtype=np.float32)
+
+    dims3 = ("time_counter", "deptht", "y", "x")
+    dims2 = ("time_counter", "y", "x")
+    data_vars = {"votemper": (dims3, T), "vosaline": (dims3, S)}
+    if u_name is not None:
+        data_vars[u_name] = (dims3, uv)
+    if v_name is not None:
+        data_vars[v_name] = (dims3, uv)
+    if eta_name is not None:
+        data_vars[eta_name] = (dims2, eta_data)
+
+    ds = xr.Dataset(data_vars, coords={
+        "nav_lon":      (("y", "x"), lon2d),
+        "nav_lat":      (("y", "x"), lat2d),
+        "deptht":       ("deptht",   _SRC_DEPTH),
+        "time_counter": ("time_counter", np.array([0.0])),
+    })
+    ds.to_netcdf(path)
+
+
+class TestCurvilinearFormat:
+    """End-to-end tests for NEMO/ORCA curvilinear-grid ORAS5 files."""
+
+    def test_read_shapes(self, tmp_path):
+        """read_oras5 must return correct array shapes for a NEMO file."""
+        nc = tmp_path / "nemo.nc"
+        _write_nemo_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["T"].shape   == (_NZ_SRC, _NY_SRC, _NX_SRC)
+        assert raw["S"].shape   == (_NZ_SRC, _NY_SRC, _NX_SRC)
+        assert raw["lat"].shape == (_NY_SRC, _NX_SRC)
+        assert raw["lon"].shape == (_NY_SRC, _NX_SRC)
+        assert raw["depth"].shape == (_NZ_SRC,)
+
+    def test_read_optional_none(self, tmp_path):
+        """Without u/v/eta in file, raw dict entries must be None."""
+        nc = tmp_path / "nemo_ts.nc"
+        _write_nemo_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["u"]   is None
+        assert raw["v"]   is None
+        assert raw["eta"] is None
+
+    def test_read_full_vars(self, tmp_path):
+        """With all five variables, none should be None."""
+        nc = tmp_path / "nemo_full.nc"
+        _write_nemo_nc(nc, u_name="vozocrtx", v_name="vomecrty", eta_name="sossheig")
+        raw = read_oras5(nc)
+        assert raw["u"]   is not None
+        assert raw["v"]   is not None
+        assert raw["eta"] is not None
+
+    def test_regrid_output_shapes(self, tmp_path):
+        """regrid_to_model must produce (Nx, Ny, Nz) T/S and (Nx, Ny) eta."""
+        nc = tmp_path / "nemo_r.nc"
+        _write_nemo_nc(nc, u_name="vozocrtx", v_name="vomecrty", eta_name="sossheig")
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        Nx, Ny, Nz = grid.Nx, grid.Ny, grid.Nz
+        assert state.T.shape   == (Nx, Ny, Nz)
+        assert state.S.shape   == (Nx, Ny, Nz)
+        assert state.eta.shape == (Nx, Ny)
+
+    def test_regrid_no_nan(self, tmp_path):
+        """Regridded fields from NEMO file must contain no NaN."""
+        nc = tmp_path / "nemo_nan.nc"
+        _write_nemo_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert not np.any(np.isnan(np.array(state.T))), "NaN in T"
+        assert not np.any(np.isnan(np.array(state.S))), "NaN in S"
+
+    def test_regrid_ts_values_plausible(self, tmp_path):
+        """Regridded T must stay within the synthetic source range [10, 20]."""
+        nc = tmp_path / "nemo_vals.nc"
+        _write_nemo_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        T = np.array(state.T)
+        ocean = np.array(grid.mask_c, dtype=bool)
+        assert float(T[ocean].min()) > 5.0,  "T too low"
+        assert float(T[ocean].max()) < 25.0, "T too high"
+
+
+# ---------------------------------------------------------------------------
+# TestFieldSpecificDepth — depthu/depthv distinct from deptht
+# ---------------------------------------------------------------------------
+
+# Depth levels that intentionally differ for T vs u
+_DEPTH_T = np.array([10.0, 50.0, 200.0], dtype=np.float64)
+_DEPTH_U = np.array([20.0, 100.0, 300.0], dtype=np.float64)   # different from _DEPTH_T
+
+
+def _write_nemo_diff_depth_nc(path) -> None:
+    """
+    NEMO-style file where ``vozocrtx`` (u) lives on ``depthu`` while
+    ``votemper``/``vosaline`` live on ``deptht``.  The two depth axes have
+    different values so ``read_oras5`` must return non-None ``depth_u``.
+    """
+    Nzt = len(_DEPTH_T)
+    Nzu = len(_DEPTH_U)
+    Ny, Nx = _NY_SRC, _NX_SRC
+
+    lon2d = np.tile(_SRC_LON, (Ny, 1)).astype(np.float64)
+    lat2d = np.tile(_SRC_LAT[:, np.newaxis], (1, Nx)).astype(np.float64)
+
+    T_data = np.zeros((1, Nzt, Ny, Nx), dtype=np.float32)
+    for k in range(Nzt):
+        T_data[0, k] = 20.0 - k * 5.0
+    S_data = np.full((1, Nzt, Ny, Nx), 35.0, dtype=np.float32)
+    u_data = np.zeros((1, Nzu, Ny, Nx), dtype=np.float32)
+
+    ds = xr.Dataset(
+        {
+            "votemper": (("time_counter", "deptht", "y", "x"), T_data),
+            "vosaline": (("time_counter", "deptht", "y", "x"), S_data),
+            "vozocrtx": (("time_counter", "depthu", "y", "x"), u_data),
+        },
+        coords={
+            "nav_lon":      (("y", "x"), lon2d),
+            "nav_lat":      (("y", "x"), lat2d),
+            "deptht":       ("deptht",   _DEPTH_T),
+            "depthu":       ("depthu",   _DEPTH_U),
+            "time_counter": ("time_counter", np.array([0.0])),
+        },
+    )
+    ds.to_netcdf(path)
+
+
+class TestFieldSpecificDepth:
+    """
+    ``read_oras5`` / ``regrid_to_model`` when u uses a different depth axis
+    (``depthu``) than T/S (``deptht``).
+    """
+
+    def test_depth_u_extracted(self, tmp_path):
+        """``depth_u`` must be non-None and equal to _DEPTH_U."""
+        nc = tmp_path / "diff_depth.nc"
+        _write_nemo_diff_depth_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["depth_u"] is not None, "depth_u should be extracted from depthu"
+        np.testing.assert_allclose(raw["depth_u"], np.sort(_DEPTH_U))
+
+    def test_depth_t_unchanged(self, tmp_path):
+        """T-grid depth (``deptht``) must appear in ``raw['depth']``."""
+        nc = tmp_path / "diff_depth_t.nc"
+        _write_nemo_diff_depth_nc(nc)
+        raw = read_oras5(nc)
+        np.testing.assert_allclose(raw["depth"], np.sort(_DEPTH_T))
+
+    def test_depth_v_none_when_absent(self, tmp_path):
+        """No ``depthv`` variable in the file → ``depth_v`` must be None."""
+        nc = tmp_path / "diff_depth_nv.nc"
+        _write_nemo_diff_depth_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["depth_v"] is None, "depth_v should be None when v is absent"
+
+    def test_depth_u_none_for_regular_grid(self, tmp_path):
+        """Regular (non-NEMO) file with shared depth dim → ``depth_u`` must be None."""
+        nc = tmp_path / "reg_depth.nc"
+        _write_nc(nc, u_name="uo")
+        raw = read_oras5(nc)
+        assert raw["depth_u"] is None, "depth_u should be None when depth dim is shared"
+
+    def test_regrid_no_nan(self, tmp_path):
+        """``regrid_to_model`` must produce no NaN when u uses a different depth."""
+        nc = tmp_path / "diff_depth_rg.nc"
+        _write_nemo_diff_depth_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert not np.any(np.isnan(np.array(state.T))), "NaN in T"
+        assert not np.any(np.isnan(np.array(state.u))), "NaN in u"
+
+    def test_regrid_u_shape(self, tmp_path):
+        """Output u shape must match the target grid even when src u has Nzu levels."""
+        nc = tmp_path / "diff_depth_sh.nc"
+        _write_nemo_diff_depth_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert state.u.shape == (grid.Nx, grid.Ny, grid.Nz)
+
+
+# ---------------------------------------------------------------------------
+# TestFieldSpecificHoriz — staggered nav_lon_u / nav_lat_u
+# ---------------------------------------------------------------------------
+
+_STAGGER_DEG = 0.125   # u-grid stagger offset in longitude
+
+
+def _write_nemo_stag_horiz_nc(path) -> None:
+    """
+    NEMO-style file that contains explicit ``nav_lon_u`` / ``nav_lat_u``
+    staggered coordinates (+0.125° in longitude relative to T-grid).
+    The u variable itself is stored on the same (y, x) spatial dimensions
+    as T; the staggered coords are metadata about where those u-points sit.
+    """
+    Ny, Nx = _NY_SRC, _NX_SRC
+
+    lon2d   = np.tile(_SRC_LON, (Ny, 1)).astype(np.float64)
+    lat2d   = np.tile(_SRC_LAT[:, np.newaxis], (1, Nx)).astype(np.float64)
+    lon_u2d = lon2d + _STAGGER_DEG    # u-grid: staggered +0.125° in lon
+    lat_u2d = lat2d                   # u-grid: same lat as T
+
+    T_data = _make_T()[np.newaxis]
+    S_data = _make_S()[np.newaxis]
+    u_data = np.zeros_like(T_data)
+
+    ds = xr.Dataset(
+        {
+            "votemper": (("time_counter", "deptht", "y", "x"), T_data),
+            "vosaline": (("time_counter", "deptht", "y", "x"), S_data),
+            "vozocrtx": (("time_counter", "deptht", "y", "x"), u_data),
+        },
+        coords={
+            "nav_lon":      (("y", "x"), lon2d),
+            "nav_lat":      (("y", "x"), lat2d),
+            "nav_lon_u":    (("y", "x"), lon_u2d),
+            "nav_lat_u":    (("y", "x"), lat_u2d),
+            "deptht":       ("deptht",   _SRC_DEPTH),
+            "time_counter": ("time_counter", np.array([0.0])),
+        },
+    )
+    ds.to_netcdf(path)
+
+
+class TestFieldSpecificHoriz:
+    """
+    ``read_oras5`` / ``regrid_to_model`` when explicit staggered horizontal
+    coordinate arrays (``nav_lon_u`` / ``nav_lat_u``) are present.
+    """
+
+    def test_lon_u_extracted(self, tmp_path):
+        """``lon_u`` must be non-None and differ from ``lon`` by ~_STAGGER_DEG."""
+        nc = tmp_path / "stag_horiz.nc"
+        _write_nemo_stag_horiz_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["lon_u"] is not None, "lon_u should be extracted from nav_lon_u"
+        delta = raw["lon_u"] - raw["lon"]
+        np.testing.assert_allclose(delta, _STAGGER_DEG, atol=1e-9)
+
+    def test_lat_u_same_as_t(self, tmp_path):
+        """``lat_u`` must equal the T-grid lat (no lat stagger in this fixture)."""
+        nc = tmp_path / "stag_horiz_lat.nc"
+        _write_nemo_stag_horiz_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["lat_u"] is not None
+        np.testing.assert_allclose(raw["lat_u"], raw["lat"], atol=1e-9)
+
+    def test_lon_u_none_regular_grid(self, tmp_path):
+        """Regular-grid file has no nav_lon_u → ``lon_u`` must be None."""
+        nc = tmp_path / "reg_stag.nc"
+        _write_nc(nc, u_name="uo")
+        raw = read_oras5(nc)
+        assert raw["lon_u"] is None, "lon_u should be None for regular-grid file"
+
+    def test_lon_v_lat_v_none_when_absent(self, tmp_path):
+        """File has nav_lon_u/nav_lat_u but not nav_lon_v/nav_lat_v → v coords None."""
+        nc = tmp_path / "stag_uonly.nc"
+        _write_nemo_stag_horiz_nc(nc)
+        raw = read_oras5(nc)
+        assert raw["lon_v"] is None
+        assert raw["lat_v"] is None
+
+    def test_regrid_no_nan_staggered(self, tmp_path):
+        """``regrid_to_model`` must produce no NaN when u uses staggered coords."""
+        nc = tmp_path / "stag_rg.nc"
+        _write_nemo_stag_horiz_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert not np.any(np.isnan(np.array(state.T))), "NaN in T"
+        assert not np.any(np.isnan(np.array(state.u))), "NaN in u"
+
+    def test_regrid_output_shape_staggered(self, tmp_path):
+        """Output shape must match the target grid when staggered u coords are used."""
+        nc = tmp_path / "stag_shape.nc"
+        _write_nemo_stag_horiz_nc(nc)
+        grid  = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert state.u.shape == (grid.Nx, grid.Ny, grid.Nz)

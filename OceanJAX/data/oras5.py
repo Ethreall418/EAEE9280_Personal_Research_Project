@@ -4,11 +4,17 @@ OceanJAX ORAS5 data loader
 Loads the Copernicus Marine Service ORAS5 ocean reanalysis product
 (GLOBAL_MULTIYEAR_PHY_001_030) and regrids it onto an OceanJAX model grid.
 
-Targeted format
----------------
-Regular 0.25° lat-lon grid, 1-D coordinate variables, 75 vertical levels,
-NetCDF-CF convention.  Native NEMO/ORCA curvilinear grids (2-D coordinate
-arrays) are not supported by this loader.
+Supported formats
+-----------------
+1. **Regular 0.25° product** (Copernicus ``GLOBAL_MULTIYEAR_PHY_001_030``):
+   1-D ``longitude`` / ``latitude`` / ``depth`` coordinate variables.
+2. **Native NEMO/ORCA curvilinear grid**: 2-D ``nav_lon`` / ``nav_lat``
+   coordinates on ``(y, x)`` dimensions, ``time_counter`` time axis,
+   ``deptht`` depth axis.  Both formats are detected automatically.
+
+For curvilinear grids the horizontal step uses ``LinearNDInterpolator``
+on a Delaunay triangulation built once per call (expensive for large
+domains; subsetting source data to the target region is recommended).
 
 Variable-name aliasing
 ----------------------
@@ -56,7 +62,12 @@ import warnings
 
 import numpy as np
 import xarray as xr
-from scipy.interpolate import RegularGridInterpolator, NearestNDInterpolator
+from scipy.interpolate import (
+    RegularGridInterpolator,
+    NearestNDInterpolator,
+    LinearNDInterpolator,
+)
+from scipy.spatial import Delaunay
 
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import OceanState, create_from_arrays
@@ -79,6 +90,13 @@ _COORD_ALIASES: dict[str, list[str]] = {
     "lat":   ["latitude",  "lat", "y", "nav_lat"],
     "depth": ["depth", "deptht", "level", "lev", "z"],
 }
+
+# Dimension names recognised as depth axes when checking per-field coordinates.
+# Wider than _COORD_ALIASES["depth"] to include depthu/depthv/depthw used by
+# NEMO velocity components.
+_DEPTH_DIM_NAMES: frozenset[str] = frozenset(
+    {"depth", "deptht", "depthu", "depthv", "depthw", "level", "lev", "z"}
+)
 
 
 def _find_var(ds: xr.Dataset, key: str, optional: bool = False) -> Optional[str]:
@@ -124,8 +142,10 @@ def read_oras5(
     """
     Read one time slice from a Copernicus Marine ORAS5 NetCDF file.
 
-    Targets the regular 0.25° lat-lon product with 1-D coordinate variables.
-    Passing a file with 2-D (curvilinear) coordinates raises ``ValueError``.
+    Both the regular 0.25° lat-lon product (1-D coordinate variables) and the
+    native NEMO/ORCA curvilinear grid (2-D ``nav_lon`` / ``nav_lat``,
+    ``time_counter`` time axis, per-field ``deptht`` / ``depthu`` / ``depthv``
+    depth axes) are accepted and detected automatically.
 
     Parameters
     ----------
@@ -139,14 +159,30 @@ def read_oras5(
     dict with the following fixed keys.  Optional fields are **always**
     ``None`` when absent — never a missing key or an empty array:
 
-    ``"T"``     : ``(Nz_src, Ny_src, Nx_src)`` float32 — potential temperature [°C]
-    ``"S"``     : ``(Nz_src, Ny_src, Nx_src)`` float32 — practical salinity [psu]
-    ``"u"``     : ``(Nz_src, Ny_src, Nx_src)`` float32, or ``None``
-    ``"v"``     : ``(Nz_src, Ny_src, Nx_src)`` float32, or ``None``
-    ``"eta"``   : ``(Ny_src, Nx_src)``          float32, or ``None``
-    ``"lon"``   : ``(Nx_src,)`` float64 — degrees east, strictly ascending
-    ``"lat"``   : ``(Ny_src,)`` float64 — degrees north, strictly ascending
-    ``"depth"`` : ``(Nz_src,)`` float64 — metres positive downward, ascending
+    ``"T"``       : ``(Nz_src, Ny_src, Nx_src)`` float32 — potential temperature [°C]
+    ``"S"``       : ``(Nz_src, Ny_src, Nx_src)`` float32 — practical salinity [psu]
+    ``"u"``       : ``(Nz_src, Ny_src, Nx_src)`` float32, or ``None``
+    ``"v"``       : ``(Nz_src, Ny_src, Nx_src)`` float32, or ``None``
+    ``"eta"``     : ``(Ny_src, Nx_src)``          float32, or ``None``
+    ``"lon"``     : ``(Nx_src,)`` float64 — regular grid (degrees east, ascending).
+                    ``(Ny_src, Nx_src)`` float64 — curvilinear T-grid.
+    ``"lat"``     : ``(Ny_src,)`` float64 — regular grid (degrees north, ascending).
+                    ``(Ny_src, Nx_src)`` float64 — curvilinear T-grid.
+    ``"depth"``   : ``(Nz_src,)`` float64 — T-grid depth, metres positive downward,
+                    ascending.
+
+    Per-field coordinate keys (all ``None`` when absent or identical to T-grid):
+
+    ``"depth_u"`` : ``(Nz_u,)`` float64 — u-field depth levels, or ``None`` if
+                    identical to ``"depth"`` (e.g. Copernicus regular product,
+                    or merged NEMO files with equal ``deptht``/``depthu``).
+    ``"depth_v"`` : ``(Nz_v,)`` float64 — v-field depth levels, or ``None``.
+    ``"lon_u"``   : ``(Ny_src, Nx_src)`` float64 — u horizontal positions, or ``None``
+                    (present only when the file contains an explicit staggered
+                    coordinate such as ``nav_lon_u`` / ``glamu``).
+    ``"lat_u"``   : ``(Ny_src, Nx_src)`` float64 — u latitude positions, or ``None``.
+    ``"lon_v"``   : ``(Ny_src, Nx_src)`` float64 — v horizontal positions, or ``None``.
+    ``"lat_v"``   : ``(Ny_src, Nx_src)`` float64 — v latitude positions, or ``None``.
 
     Land / fill-value cells are returned as ``np.nan`` (xarray's
     ``mask_and_scale=True`` handles ``_FillValue`` / ``missing_value``
@@ -163,48 +199,101 @@ def read_oras5(
         lat   = np.asarray(ds[lat_name].values,   dtype=np.float64)
         depth = np.asarray(ds[depth_name].values, dtype=np.float64)
 
-        if lon.ndim != 1 or lat.ndim != 1 or depth.ndim != 1:
+        if depth.ndim != 1:
             raise ValueError(
-                "read_oras5 requires 1-D lon/lat/depth coordinates "
-                "(Copernicus Marine regular-grid product).  "
-                "Found 2-D coordinate arrays — native NEMO/ORCA curvilinear "
-                "grids are not supported by this loader."
+                f"depth coordinate must be 1-D; found shape {depth.shape}."
             )
+
+        # Detect curvilinear (NEMO/ORCA) vs. regular grid
+        curvilinear = lon.ndim != 1 or lat.ndim != 1
 
         # Ensure depth is positive downward
         if np.any(depth < 0):
             depth = -depth
 
-        # Sort all axes to strictly ascending order
-        lon,   lon_idx = _ensure_ascending(lon)
-        lat,   lat_idx = _ensure_ascending(lat)
+        # Always sort depth to strictly ascending order
         depth, dep_idx = _ensure_ascending(depth)
 
+        # For regular grids also sort lat/lon
+        lon_idx = lat_idx = None
+        if not curvilinear:
+            lon, lon_idx = _ensure_ascending(lon)
+            lat, lat_idx = _ensure_ascending(lat)
+
+        # --- time-dimension helper (accepts both "time" and "time_counter") ---
+        def _drop_time(da):
+            time_dim = next(
+                (d for d in da.dims if "time" in d.lower()), None
+            )
+            if time_dim is not None:
+                da = da.isel({time_dim: time_index})
+            return da
+
         # --- load and reorder a 3-D variable ---
-        def _load_3d(var_name: str) -> np.ndarray:
-            da = ds[var_name]
-            if "time" in da.dims:
-                da = da.isel(time=time_index)
-            arr = np.asarray(da.values, dtype=np.float32)
-            if arr.ndim != 3:
+        # Axis order is determined explicitly from da.dims so that files whose
+        # dimensions arrive in non-canonical order are handled correctly.
+        _lat_dim_names = frozenset(_COORD_ALIASES["lat"])
+        _lon_dim_names = frozenset(_COORD_ALIASES["lon"])
+
+        def _load_3d(var_name: str, field_dep_idx=None) -> np.ndarray:
+            _di = dep_idx if field_dep_idx is None else field_dep_idx
+            da = _drop_time(ds[var_name])
+            if da.ndim != 3:
                 raise ValueError(
-                    f"Variable '{var_name}' has {arr.ndim} dimensions after "
-                    f"time selection; expected 3 (depth, lat, lon)."
+                    f"Variable '{var_name}' has {da.ndim} dimensions after "
+                    f"time selection; expected 3 (depth, spatial1, spatial2). "
+                    f"Dims: {da.dims}"
                 )
-            return arr[np.ix_(dep_idx, lat_idx, lon_idx)]
+
+            # Identify the depth axis for this variable by dim name
+            var_depth_dim = next(
+                (d for d in da.dims
+                 if d.lower() in _DEPTH_DIM_NAMES and "time" not in d.lower()),
+                None,
+            )
+
+            if curvilinear:
+                # Reorder to (depth_dim, y, x); keep y/x in their original order.
+                if var_depth_dim is not None and da.dims[0] != var_depth_dim:
+                    spatial = [d for d in da.dims if d != var_depth_dim]
+                    da = da.transpose(var_depth_dim, *spatial)
+                arr = np.asarray(da.values, dtype=np.float32)
+                return arr[_di, :, :]
+            else:
+                # Reorder to (depth_dim, lat_dim, lon_dim) by name.
+                lat_dim = next((d for d in da.dims if d in _lat_dim_names), None)
+                lon_dim = next((d for d in da.dims if d in _lon_dim_names), None)
+                if var_depth_dim is not None and lat_dim is not None and lon_dim is not None:
+                    da = da.transpose(var_depth_dim, lat_dim, lon_dim)
+                elif var_depth_dim is not None and da.dims[0] != var_depth_dim:
+                    # Depth is not first but lat/lon dims are unrecognised — move depth to front
+                    spatial = [d for d in da.dims if d != var_depth_dim]
+                    da = da.transpose(var_depth_dim, *spatial)
+                arr = np.asarray(da.values, dtype=np.float32)
+                return arr[np.ix_(_di, lat_idx, lon_idx)]
 
         # --- load and reorder a 2-D variable ---
         def _load_2d(var_name: str) -> np.ndarray:
-            da = ds[var_name]
-            if "time" in da.dims:
-                da = da.isel(time=time_index)
-            arr = np.asarray(da.values, dtype=np.float32)
-            if arr.ndim != 2:
+            da = _drop_time(ds[var_name])
+            if da.ndim != 2:
                 raise ValueError(
-                    f"Variable '{var_name}' has {arr.ndim} dimensions after "
-                    f"time selection; expected 2 (lat, lon)."
+                    f"Variable '{var_name}' has {da.ndim} dimensions after "
+                    f"time selection; expected 2 (lat/y, lon/x). "
+                    f"Dims: {da.dims}"
                 )
-            return arr[np.ix_(lat_idx, lon_idx)]
+
+            if curvilinear:
+                # Spatial dims are named y/x — keep original order (y, x).
+                arr = np.asarray(da.values, dtype=np.float32)
+                return arr
+            else:
+                # Reorder to (lat_dim, lon_dim) by name.
+                lat_dim = next((d for d in da.dims if d in _lat_dim_names), None)
+                lon_dim = next((d for d in da.dims if d in _lon_dim_names), None)
+                if lat_dim is not None and lon_dim is not None:
+                    da = da.transpose(lat_dim, lon_dim)
+                arr = np.asarray(da.values, dtype=np.float32)
+                return arr[np.ix_(lat_idx, lon_idx)]
 
         T = _load_3d(_find_var(ds, "T"))
         S = _load_3d(_find_var(ds, "S"))
@@ -213,9 +302,52 @@ def read_oras5(
         v_name   = _find_var(ds, "v",   optional=True)
         eta_name = _find_var(ds, "eta", optional=True)
 
-        u   = _load_3d(u_name)   if u_name   is not None else None
-        v   = _load_3d(v_name)   if v_name   is not None else None
-        eta = _load_2d(eta_name) if eta_name is not None else None
+        # --- per-field depth (e.g. depthu/depthv may differ from deptht) ---
+        def _field_depth(var_name_f):
+            """Return (depth_arr, dep_idx_f) for var_name_f, or (None, dep_idx)."""
+            if var_name_f is None or var_name_f not in ds:
+                return None, dep_idx
+            da_f = ds[var_name_f]
+            field_depth_dim = next(
+                (d for d in da_f.dims
+                 if d.lower() in _DEPTH_DIM_NAMES and "time" not in d.lower()),
+                None,
+            )
+            if field_depth_dim is None or field_depth_dim == depth_name:
+                return None, dep_idx
+            arr = np.asarray(ds[field_depth_dim].values, dtype=np.float64)
+            if np.any(arr < 0):
+                arr = -arr
+            arr_sorted, order = _ensure_ascending(arr)
+            if arr_sorted.shape == depth.shape and np.allclose(arr_sorted, depth):
+                return None, dep_idx
+            return arr_sorted, order
+
+        depth_u, u_dep_idx = _field_depth(u_name)
+        depth_v, v_dep_idx = _field_depth(v_name)
+
+        # --- per-field horizontal coordinates (staggered grids in separate files) ---
+        _STAG_ALIASES = {
+            "lon_u": ["nav_lon_u", "glamu"],
+            "lat_u": ["nav_lat_u", "gphiu"],
+            "lon_v": ["nav_lon_v", "glamv"],
+            "lat_v": ["nav_lat_v", "gphiv"],
+        }
+
+        def _find_stag_coord(aliases):
+            for a in aliases:
+                if a in ds.coords or a in ds:
+                    return np.asarray(ds[a].values, dtype=np.float64)
+            return None
+
+        lon_u = _find_stag_coord(_STAG_ALIASES["lon_u"])
+        lat_u = _find_stag_coord(_STAG_ALIASES["lat_u"])
+        lon_v = _find_stag_coord(_STAG_ALIASES["lon_v"])
+        lat_v = _find_stag_coord(_STAG_ALIASES["lat_v"])
+
+        u   = _load_3d(u_name,   u_dep_idx) if u_name   is not None else None
+        v   = _load_3d(v_name,   v_dep_idx) if v_name   is not None else None
+        eta = _load_2d(eta_name)            if eta_name is not None else None
 
     finally:
         ds.close()
@@ -223,6 +355,9 @@ def read_oras5(
     return {
         "T": T, "S": S, "u": u, "v": v, "eta": eta,
         "lon": lon, "lat": lat, "depth": depth,
+        "depth_u": depth_u, "depth_v": depth_v,
+        "lon_u": lon_u, "lat_u": lat_u,
+        "lon_v": lon_v, "lat_v": lat_v,
     }
 
 
@@ -408,14 +543,215 @@ def _interp_2d(
     return out.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# Private: curvilinear (NEMO/ORCA) interpolation helpers
+# ---------------------------------------------------------------------------
+
+_CURV_BUFFER_DEG = 5.0  # degrees of padding around the target domain
+
+
+def _curv_build_tri(
+    src_lat2d: np.ndarray,
+    src_lon2d: np.ndarray,
+    tgt_lat:   np.ndarray,
+    tgt_lon:   np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Subset source points to a buffer around the target domain and build a
+    Delaunay triangulation.  Subsetting reduces the triangulation cost from
+    O(N_global) to O(N_region), which is critical for global ORCA grids.
+
+    Returns
+    -------
+    tri       : ``scipy.spatial.Delaunay`` object
+    sub_lat   : 1-D lat of subset source points
+    sub_lon   : 1-D lon of subset source points
+    in_region : bool mask ``(Ny_src, Nx_src)`` — True for included points
+    """
+    lat_lo = tgt_lat.min() - _CURV_BUFFER_DEG
+    lat_hi = tgt_lat.max() + _CURV_BUFFER_DEG
+
+    # Unify tgt_lon to match the source convention before computing the
+    # subsetting window (handles 0–360 vs −180–180 mismatch).
+    tgt_lon_u = _unify_lon(src_lon2d.ravel(), tgt_lon)
+    lon_lo = tgt_lon_u.min() - _CURV_BUFFER_DEG
+    lon_hi = tgt_lon_u.max() + _CURV_BUFFER_DEG
+
+    in_region = (
+        (src_lat2d >= lat_lo) & (src_lat2d <= lat_hi) &
+        (src_lon2d >= lon_lo) & (src_lon2d <= lon_hi)
+    )
+
+    # Fall back to the full grid if the buffer contains too few points
+    if in_region.sum() < 10:
+        in_region = np.ones_like(src_lat2d, dtype=bool)
+
+    sub_pts = np.stack(
+        [src_lat2d[in_region].ravel(), src_lon2d[in_region].ravel()],
+        axis=-1,
+    )
+    return Delaunay(sub_pts), src_lat2d[in_region].ravel(), src_lon2d[in_region].ravel(), in_region
+
+
+def _curv_interp_level(
+    src_k_flat: np.ndarray,   # (N_sub,) values at one depth level, may contain NaN
+    tri:        "Delaunay",
+    tgt_pts:    np.ndarray,   # (N_tgt, 2) query points (lat, lon)
+    Ny_tgt:     int,
+    Nx_tgt:     int,
+    fill_value: float,
+) -> np.ndarray:
+    """
+    Interpolate one horizontal level from a curvilinear source to a regular
+    target grid.  Three-tier NaN-aware strategy:
+    1. Normalised convolution via ``LinearNDInterpolator`` (no coastal contamination).
+    2. ``NearestNDInterpolator`` on valid source points only.
+    3. Constant ``fill_value`` fallback.
+    """
+    valid = ~np.isnan(src_k_flat)
+    if not np.any(valid):
+        return np.full((Ny_tgt, Nx_tgt), fill_value, dtype=np.float32)
+
+    src_filled = np.where(valid, src_k_flat, 0.0)
+    src_mask   = valid.astype(np.float64)
+
+    lin_data = LinearNDInterpolator(tri, src_filled, fill_value=0.0)
+    lin_mask = LinearNDInterpolator(tri, src_mask,   fill_value=0.0)
+    data_sum = lin_data(tgt_pts).reshape(Ny_tgt, Nx_tgt)
+    mask_sum = lin_mask(tgt_pts).reshape(Ny_tgt, Nx_tgt)
+
+    eps    = 1e-6
+    result = np.where(mask_sum > eps, data_sum / np.maximum(mask_sum, eps), np.nan)
+
+    needs_nn = np.isnan(result)
+    if np.any(needs_nn):
+        # Build NN interpolator using only valid-point coordinates
+        src_pts_valid = np.stack(
+            [tri.points[valid, 0], tri.points[valid, 1]], axis=-1
+        )
+        nn = NearestNDInterpolator(src_pts_valid, src_k_flat[valid])
+        result = np.where(needs_nn, nn(tgt_pts).reshape(Ny_tgt, Nx_tgt), result)
+
+    still_nan = np.isnan(result)
+    if np.any(still_nan):
+        result = np.where(still_nan, fill_value, result)
+
+    return result.astype(np.float32)
+
+
+def _interp_curvilinear_3d(
+    src:        np.ndarray,   # (Nz_src, Ny_src, Nx_src)
+    src_lat2d:  np.ndarray,   # (Ny_src, Nx_src)
+    src_lon2d:  np.ndarray,   # (Ny_src, Nx_src)
+    src_depth:  np.ndarray,   # (Nz_src,) ascending
+    tgt_lon:    np.ndarray,   # (Nx_tgt,)
+    tgt_lat:    np.ndarray,   # (Ny_tgt,)
+    tgt_depth:  np.ndarray,   # (Nz_tgt,) ascending
+    fill_value: float,
+) -> np.ndarray:
+    """
+    Interpolate a curvilinear 3-D field onto a regular target grid.
+
+    Two-step approach:
+    1. Per-source-level horizontal interpolation using normalised convolution
+       (``LinearNDInterpolator``) + NN fallback in (lat, lon) only.
+    2. Vertical linear interpolation from ``src_depth`` to ``tgt_depth``;
+       nearest-level clamping for depths outside the source range.
+
+    A Delaunay triangulation is built once on the subset of source points
+    within ``_CURV_BUFFER_DEG`` of the target domain to keep runtime
+    manageable for global ORCA grids.
+    """
+    Nz_src = len(src_depth)
+    Ny_tgt, Nx_tgt = len(tgt_lat), len(tgt_lon)
+
+    tri, _, _, in_region = _curv_build_tri(src_lat2d, src_lon2d, tgt_lat, tgt_lon)
+
+    dy_tgt, dx_tgt = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+    tgt_pts = np.stack([dy_tgt.ravel(), dx_tgt.ravel()], axis=-1)
+
+    # Step 1: horizontal interpolation at every source depth level
+    horiz = np.full((Nz_src, Ny_tgt, Nx_tgt), fill_value, dtype=np.float64)
+    for k in range(Nz_src):
+        horiz[k] = _curv_interp_level(
+            src[k][in_region].ravel().astype(np.float64),
+            tri, tgt_pts, Ny_tgt, Nx_tgt, fill_value,
+        )
+
+    # Step 2: vertical linear interpolation (nearest-level extrapolation)
+    Nz_tgt = len(tgt_depth)
+    out = np.empty((Nz_tgt, Ny_tgt, Nx_tgt), dtype=np.float32)
+    for k_tgt, z in enumerate(tgt_depth):
+        idx = int(np.searchsorted(src_depth, z, side="right")) - 1
+        idx = max(0, min(idx, Nz_src - 2))
+        z0, z1 = src_depth[idx], src_depth[idx + 1]
+        w1 = float(np.clip((z - z0) / (z1 - z0), 0.0, 1.0))
+        out[k_tgt] = ((1.0 - w1) * horiz[idx] + w1 * horiz[idx + 1]).astype(np.float32)
+
+    return out
+
+
+def _interp_curvilinear_2d(
+    src:        np.ndarray,   # (Ny_src, Nx_src)
+    src_lat2d:  np.ndarray,
+    src_lon2d:  np.ndarray,
+    tgt_lon:    np.ndarray,
+    tgt_lat:    np.ndarray,
+    fill_value: float,
+) -> np.ndarray:
+    """Horizontal-only curvilinear interpolation for 2-D fields (e.g. eta)."""
+    Ny_tgt, Nx_tgt = len(tgt_lat), len(tgt_lon)
+
+    tri, _, _, in_region = _curv_build_tri(src_lat2d, src_lon2d, tgt_lat, tgt_lon)
+    dy_tgt, dx_tgt = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+    tgt_pts = np.stack([dy_tgt.ravel(), dx_tgt.ravel()], axis=-1)
+
+    return _curv_interp_level(
+        src[in_region].ravel().astype(np.float64),
+        tri, tgt_pts, Ny_tgt, Nx_tgt, fill_value,
+    )
+
+
+def _unify_lon(
+    src_lon: np.ndarray,
+    tgt_lon: np.ndarray,
+) -> np.ndarray:
+    """
+    Shift ``tgt_lon`` values by ±360° so that they fall inside the longitude
+    window spanned by ``src_lon``.
+
+    This resolves 0–360 vs −180–180 convention mismatches (the most common
+    case when the Copernicus regular product and a model grid use different
+    conventions).
+
+    **Limitation**: a target domain that straddles the dateline (e.g., a
+    region spanning both sides of ±180°) is *not* handled.  For such domains
+    the caller should split the request into two sub-domains or re-project
+    the coordinates before calling ``regrid_to_model``.
+    """
+    src_min = float(np.nanmin(src_lon))
+    src_max = float(np.nanmax(src_lon))
+    # Give a 10° margin so that values just outside the source domain are
+    # still shifted correctly before the out-of-domain warning triggers.
+    out = tgt_lon.copy()
+    out = np.where(out < src_min - 10.0, out + 360.0, out)
+    out = np.where(out > src_max + 10.0, out - 360.0, out)
+    return out
+
+
 def _check_resolution(
     src_lon: np.ndarray,
     src_lat: np.ndarray,
     tgt_lon: np.ndarray,
     tgt_lat: np.ndarray,
 ) -> None:
-    src_dx = float(np.median(np.diff(src_lon)))
-    src_dy = float(np.median(np.diff(src_lat)))
+    if src_lon.ndim == 1:
+        src_dx = float(np.median(np.diff(src_lon)))
+        src_dy = float(np.median(np.diff(src_lat)))
+    else:
+        # Curvilinear: estimate grid spacing from adjacent-cell differences
+        src_dx = float(np.median(np.abs(np.diff(src_lon, axis=1))))
+        src_dy = float(np.median(np.abs(np.diff(src_lat, axis=0))))
     tgt_dx = float(np.median(np.diff(tgt_lon))) if len(tgt_lon) > 1 else src_dx
     tgt_dy = float(np.median(np.diff(tgt_lat))) if len(tgt_lat) > 1 else src_dy
     if tgt_dx < src_dx * 0.9 or tgt_dy < src_dy * 0.9:
@@ -466,9 +802,18 @@ def regrid_to_model(
     src_lat   = raw["lat"]
     src_depth = raw["depth"]
 
+    # Per-field source depths — fall back to T-grid if not explicitly provided.
+    u_src_depth = raw["depth_u"] if raw.get("depth_u") is not None else src_depth
+    v_src_depth = raw["depth_v"] if raw.get("depth_v") is not None else src_depth
+
     tgt_lon   = np.asarray(grid.lon_c)
     tgt_lat   = np.asarray(grid.lat_c)
     tgt_depth = np.asarray(grid.z_c)
+
+    # Align tgt_lon to the same 0–360 / −180–180 window as the source so
+    # that interpolation queries land inside the source domain.
+    tgt_lon = _unify_lon(src_lon if src_lon.ndim == 1 else src_lon.ravel(),
+                         tgt_lon)
 
     _check_resolution(src_lon, src_lat, tgt_lon, tgt_lat)
 
@@ -484,38 +829,78 @@ def regrid_to_model(
             stacklevel=2,
         )
 
-    kw3 = dict(src_lon=src_lon, src_lat=src_lat, src_depth=src_depth,
-               tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
-    kw2 = dict(src_lon=src_lon, src_lat=src_lat,
-               tgt_lon=tgt_lon, tgt_lat=tgt_lat)
-
     Nz = len(tgt_depth)
     Ny = len(tgt_lat)
     Nx = len(tgt_lon)
 
-    # Interpolate: each _interp_* returns (Nz_tgt, Ny_tgt, Nx_tgt)
-    T_zyx = _interp_3d(raw["T"], **kw3, fill_value=T_fill)
-    S_zyx = _interp_3d(raw["S"], **kw3, fill_value=S_fill)
+    curvilinear = src_lat.ndim == 2
 
-    # u and v are treated independently: one may be present without the other.
-    u_zyx = (_interp_3d(raw["u"], **kw3, fill_value=0.0)
-              if raw["u"] is not None
-              else np.zeros((Nz, Ny, Nx), dtype=np.float32))
-    v_zyx = (_interp_3d(raw["v"], **kw3, fill_value=0.0)
-              if raw["v"] is not None
-              else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+    if curvilinear:
+        # ---- NEMO/ORCA curvilinear grid pipeline ----
+        # Per-field horizontal coords — fall back to T-grid when absent
+        # (merged files lose per-variable nav_lon/nav_lat stagger).
+        u_src_lat2d = raw["lat_u"] if raw.get("lat_u") is not None else src_lat
+        u_src_lon2d = raw["lon_u"] if raw.get("lon_u") is not None else src_lon
+        v_src_lat2d = raw["lat_v"] if raw.get("lat_v") is not None else src_lat
+        v_src_lon2d = raw["lon_v"] if raw.get("lon_v") is not None else src_lon
 
-    # Zero out levels below the deepest ORAS5 level for fields that came from
-    # data.  Extrapolating bottom velocities downward is physically wrong.
-    below_src = tgt_depth > src_depth.max()
-    if np.any(below_src):
-        if raw["u"] is not None:
-            u_zyx[below_src] = 0.0
-        if raw["v"] is not None:
-            v_zyx[below_src] = 0.0
-    eta_yx  = (_interp_2d(raw["eta"], **kw2, fill_value=0.0)
-               if raw["eta"] is not None
-               else np.zeros((Ny, Nx), dtype=np.float32))
+        kw3c   = dict(src_lat2d=src_lat,    src_lon2d=src_lon,    src_depth=src_depth,
+                      tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw3c_u = dict(src_lat2d=u_src_lat2d, src_lon2d=u_src_lon2d, src_depth=u_src_depth,
+                      tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw3c_v = dict(src_lat2d=v_src_lat2d, src_lon2d=v_src_lon2d, src_depth=v_src_depth,
+                      tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw2c   = dict(src_lat2d=src_lat,    src_lon2d=src_lon,
+                      tgt_lon=tgt_lon, tgt_lat=tgt_lat)
+
+        T_zyx = _interp_curvilinear_3d(raw["T"], **kw3c, fill_value=T_fill)
+        S_zyx = _interp_curvilinear_3d(raw["S"], **kw3c, fill_value=S_fill)
+
+        u_zyx = (_interp_curvilinear_3d(raw["u"], **kw3c_u, fill_value=0.0)
+                  if raw["u"] is not None
+                  else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+        v_zyx = (_interp_curvilinear_3d(raw["v"], **kw3c_v, fill_value=0.0)
+                  if raw["v"] is not None
+                  else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+        eta_yx = (_interp_curvilinear_2d(raw["eta"], **kw2c, fill_value=0.0)
+                  if raw["eta"] is not None
+                  else np.zeros((Ny, Nx), dtype=np.float32))
+    else:
+        # ---- Regular (Copernicus) grid pipeline ----
+        # Regular ORAS5 product shares the same 1-D lat/lon for all variables;
+        # only depth can differ per field.
+        kw3   = dict(src_lon=src_lon, src_lat=src_lat, src_depth=src_depth,
+                     tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw3_u = dict(src_lon=src_lon, src_lat=src_lat, src_depth=u_src_depth,
+                     tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw3_v = dict(src_lon=src_lon, src_lat=src_lat, src_depth=v_src_depth,
+                     tgt_lon=tgt_lon, tgt_lat=tgt_lat, tgt_depth=tgt_depth)
+        kw2   = dict(src_lon=src_lon, src_lat=src_lat,
+                     tgt_lon=tgt_lon, tgt_lat=tgt_lat)
+
+        T_zyx = _interp_3d(raw["T"], **kw3, fill_value=T_fill)
+        S_zyx = _interp_3d(raw["S"], **kw3, fill_value=S_fill)
+
+        u_zyx = (_interp_3d(raw["u"], **kw3_u, fill_value=0.0)
+                  if raw["u"] is not None
+                  else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+        v_zyx = (_interp_3d(raw["v"], **kw3_v, fill_value=0.0)
+                  if raw["v"] is not None
+                  else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+        eta_yx = (_interp_2d(raw["eta"], **kw2, fill_value=0.0)
+                  if raw["eta"] is not None
+                  else np.zeros((Ny, Nx), dtype=np.float32))
+
+    # Zero out u/v levels below each field's deepest ORAS5 level.
+    # Extrapolating bottom velocities downward is physically wrong.
+    if raw["u"] is not None:
+        below_u = tgt_depth > u_src_depth.max()
+        if np.any(below_u):
+            u_zyx[below_u] = 0.0
+    if raw["v"] is not None:
+        below_v = tgt_depth > v_src_depth.max()
+        if np.any(below_v):
+            v_zyx[below_v] = 0.0
 
     # Transpose (Nz, Ny, Nx) → (Nx, Ny, Nz) for OceanJAX convention
     T   = T_zyx.transpose(2, 1, 0)
