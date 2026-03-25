@@ -1,7 +1,7 @@
 """
 run_simulation.py  v2
 =====================
-Entry-point script for OceanJAX idealised simulations.
+Entry-point script for OceanJAX simulations.
 
 Usage
 -----
@@ -9,7 +9,10 @@ Usage
 
 The script:
   1. Builds an OceanGrid over a user-specified domain.
-  2. Initialises a resting ocean state (uniform T, S; zero velocity).
+  2. Initialises the ocean state:
+       ``--init rest``   — uniform T/S, zero velocity  (default).
+       ``--init oras5``  — interpolated from a Copernicus Marine ORAS5
+                           NetCDF file (requires ``--oras5_path``).
   3. Applies optional constant surface forcing.
   4. Integrates forward using chunked jax.lax.scan calls.
   5. Writes T, S, eta snapshots to a NetCDF file whenever the step counter
@@ -44,6 +47,8 @@ from OceanJAX.grid import OceanGrid
 from OceanJAX.state import ModelParams, OceanState, create_rest_state
 from OceanJAX.timeStepping import SurfaceForcing
 from OceanJAX.timeStepping import run as ocean_run
+# load_oras5 is imported lazily inside _build_initial_state to keep startup fast
+# when --init rest is used.
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +72,26 @@ def _parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--lat_max",   type=float, default=20.0,  help="North boundary [deg north]")
     g.add_argument("--depth_max", type=float, default=500.0, help="Ocean depth [m]")
 
+    # Initialisation
+    ini = p.add_argument_group("initialisation")
+    ini.add_argument("--init", choices=["rest", "oras5"], default="rest",
+                     help="Initial condition source")
+    ini.add_argument("--oras5_path", type=str, default=None,
+                     help="Path to ORAS5 NetCDF file (required when --init oras5)")
+    ini.add_argument("--oras5_time_index", type=int, default=0,
+                     help="Time index within the ORAS5 file")
+    ini.add_argument("--oras5_T_fill", type=float, default=10.0,
+                     help="T fallback for uncovered points [degC]")
+    ini.add_argument("--oras5_S_fill", type=float, default=35.0,
+                     help="S fallback for uncovered points [psu]")
+
     # Physics
     ph = p.add_argument_group("physics")
     ph.add_argument("--dt",    type=float, default=900.0, help="Time step [s]")
-    ph.add_argument("--T_bg",  type=float, default=10.0,  help="Initial uniform temperature [degC]")
-    ph.add_argument("--S_bg",  type=float, default=35.0,  help="Initial uniform salinity [psu]")
+    ph.add_argument("--T_bg",  type=float, default=10.0,
+                    help="Initial uniform temperature [degC]  (--init rest only)")
+    ph.add_argument("--S_bg",  type=float, default=35.0,
+                    help="Initial uniform salinity [psu]  (--init rest only)")
 
     # Surface forcing (constant in time and space)
     f = p.add_argument_group("surface forcing")
@@ -102,16 +122,54 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 def _validate_args(args: argparse.Namespace) -> None:
     errors = []
+    # run control
     if args.chunk_size < 1:
         errors.append("chunk_size must be >= 1")
     if args.n_steps < 1:
         errors.append("n_steps must be >= 1")
     if args.save_interval < 1:
         errors.append("save_interval must be >= 1")
+    # grid geometry
+    if args.dt <= 0:
+        errors.append("dt must be > 0")
+    if args.depth_max <= 0:
+        errors.append("depth_max must be > 0")
+    if args.lon_max <= args.lon_min:
+        errors.append("lon_max must be > lon_min")
+    if args.lat_max <= args.lat_min:
+        errors.append("lat_max must be > lat_min")
+    # initialisation
+    if args.init == "oras5" and args.oras5_path is None:
+        errors.append("--oras5_path is required when --init oras5")
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Initial state
+# ---------------------------------------------------------------------------
+
+def _build_initial_state(args: argparse.Namespace, grid: OceanGrid) -> OceanState:
+    """Build the initial OceanState according to --init mode."""
+    if args.init == "rest":
+        return create_rest_state(grid, T_background=args.T_bg,
+                                 S_background=args.S_bg)
+    # oras5
+    from OceanJAX.data.oras5 import load_oras5
+    print(
+        f"Loading ORAS5 from {args.oras5_path!r}  "
+        f"(time_index={args.oras5_time_index})",
+        file=sys.stderr,
+    )
+    return load_oras5(
+        args.oras5_path,
+        grid,
+        time_index=args.oras5_time_index,
+        T_fill=args.oras5_T_fill,
+        S_fill=args.oras5_S_fill,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +220,10 @@ def _create_output_file(path: str, grid: OceanGrid, args: argparse.Namespace) ->
     ds.n_steps       = args.n_steps
     ds.chunk_size    = args.chunk_size
     ds.save_interval = args.save_interval
+    ds.init_mode     = args.init
+    if args.init == "oras5":
+        ds.oras5_path       = str(args.oras5_path)
+        ds.oras5_time_index = args.oras5_time_index
 
     # Dimensions
     ds.createDimension("time", None)   # unlimited
@@ -227,8 +289,16 @@ def _print_diag(step: int, n_steps: int, state: OceanState, wall_dt: float) -> b
     """Print one diagnostic line to stderr.  Returns True if NaN is detected."""
     T   = np.array(state.T)
     S   = np.array(state.S)
+    u   = np.array(state.u)
+    v   = np.array(state.v)
     eta = np.array(state.eta)
-    has_nan = bool(np.any(np.isnan(T)) or np.any(np.isnan(S)) or np.any(np.isnan(eta)))
+    has_nan = bool(
+        np.any(np.isnan(T))   or
+        np.any(np.isnan(S))   or
+        np.any(np.isnan(u))   or
+        np.any(np.isnan(v))   or
+        np.any(np.isnan(eta))
+    )
 
     print(
         f"[step {step:05d}/{n_steps:05d}]  "
@@ -265,7 +335,7 @@ def main(argv=None) -> None:
 
     # --- model parameters and initial state ---
     params = ModelParams(dt=args.dt)
-    state  = create_rest_state(grid, T_background=args.T_bg, S_background=args.S_bg)
+    state  = _build_initial_state(args, grid)
 
     # --- JIT-compiled scan loop ---
     # n_steps is static: JAX caches a separate compiled trace per unique value.

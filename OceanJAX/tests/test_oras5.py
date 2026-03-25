@@ -362,6 +362,22 @@ class TestRegridToModel:
             "Non-zero T values in land cells after regridding"
         )
 
+    def test_u_without_v_does_not_crash(self, tmp_path):
+        """u present but v absent: regrid must succeed and v must be zero."""
+        nc = tmp_path / "u_only.nc"
+        _write_nc(nc, u_name="uo")   # v_name=None by default
+        grid = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert np.allclose(np.array(state.v), 0.0), "v should be zero when absent"
+
+    def test_v_without_u_does_not_crash(self, tmp_path):
+        """v present but u absent: regrid must succeed and u must be zero."""
+        nc = tmp_path / "v_only.nc"
+        _write_nc(nc, v_name="vo")   # u_name=None by default
+        grid = _target_grid()
+        state = regrid_to_model(read_oras5(nc), grid)
+        assert np.allclose(np.array(state.u), 0.0), "u should be zero when absent"
+
     def test_no_coastal_contamination(self, tmp_path):
         """
         NaN-aware fill must not bleed fill_value into coast-adjacent ocean cells.

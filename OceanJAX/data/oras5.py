@@ -322,8 +322,10 @@ def _interp_3d(
 
     Three-tier NaN strategy:
     1. Normalised convolution (NaN-aware linear) — no coastal contamination.
-    2. Per-level ``NearestNDInterpolator`` on valid source points only —
-       fills points where the local linear stencil is entirely NaN.
+    2. Per-level 2-D ``NearestNDInterpolator`` in (lat, lon) only, querying
+       the nearest source depth level — fills points where the linear stencil
+       is entirely NaN without mixing depth (m) with lat/lon (°) in the
+       distance metric.
     3. Constant ``fill_value`` as final fallback.
     """
     out = _normalized_conv_3d(
@@ -333,32 +335,32 @@ def _interp_3d(
 
     needs_nn = np.isnan(out)
     if np.any(needs_nn):
-        # Per-level nearest-ocean-neighbour on valid source points only
-        dz_src, dy_src, dx_src = np.meshgrid(
-            src_depth, src_lat, src_lon, indexing="ij"
-        )
-        valid_mask = ~np.isnan(src)
+        # Per-level 2-D nearest-neighbour in (lat, lon) only.
+        # A 3-D NN mixing depth (metres) with lat/lon (degrees) would produce
+        # meaningless distances and borrow values from the wrong depth level.
+        # Instead, for each target level we find the nearest *source* depth
+        # level and run a 2-D NearestNDInterpolator on its valid ocean points.
+        # For target levels below src_depth.max() this naturally selects the
+        # deepest source level, giving T/S extrapolation by the bottom value.
+        dy_src, dx_src = np.meshgrid(src_lat, src_lon, indexing="ij")
+        dy_tgt, dx_tgt = np.meshgrid(tgt_lat, tgt_lon, indexing="ij")
+        tgt_pts_2d = np.stack([dy_tgt.ravel(), dx_tgt.ravel()], axis=-1)
 
-        dz, dy, dx = np.meshgrid(tgt_depth, tgt_lat, tgt_lon, indexing="ij")
         nn_fill = np.empty_like(out)
         for k in range(len(tgt_depth)):
-            # Collect valid source points across all depths for this output level
-            pts_valid = np.stack([
-                dz_src[valid_mask].ravel(),
-                dy_src[valid_mask].ravel(),
-                dx_src[valid_mask].ravel(),
-            ], axis=-1)
-            vals_valid = src[valid_mask].ravel()
-            if len(vals_valid) == 0:
-                nn_fill[k] = fill_value
-            else:
-                interp_nn = NearestNDInterpolator(pts_valid, vals_valid)
-                tgt_pts_k = np.stack([
-                    dz[k].ravel(), dy[k].ravel(), dx[k].ravel()
-                ], axis=-1)
-                nn_fill[k] = interp_nn(tgt_pts_k).reshape(
-                    len(tgt_lat), len(tgt_lon)
-                )
+            k_src   = int(np.argmin(np.abs(src_depth - tgt_depth[k])))
+            valid_k = ~np.isnan(src[k_src])          # (Ny_src, Nx_src)
+
+            if not np.any(valid_k):
+                nn_fill[k] = np.nan      # tier-3 constant fallback handles this
+                continue
+
+            interp_nn = NearestNDInterpolator(
+                np.stack([dy_src[valid_k].ravel(), dx_src[valid_k].ravel()], axis=-1),
+                src[k_src][valid_k].ravel(),
+            )
+            nn_fill[k] = interp_nn(tgt_pts_2d).reshape(len(tgt_lat), len(tgt_lon))
+
         out = np.where(needs_nn, nn_fill, out)
 
     still_nan = np.isnan(out)
@@ -495,19 +497,22 @@ def regrid_to_model(
     T_zyx = _interp_3d(raw["T"], **kw3, fill_value=T_fill)
     S_zyx = _interp_3d(raw["S"], **kw3, fill_value=S_fill)
 
-    if raw["u"] is not None:
-        u_zyx = _interp_3d(raw["u"], **kw3, fill_value=0.0)
-        v_zyx = _interp_3d(raw["v"], **kw3, fill_value=0.0)
-        # Zero out levels that lie below the deepest ORAS5 level.
-        # Nearest-neighbour would otherwise extrapolate bottom velocities
-        # indefinitely downward, which is physically wrong.
-        below_src = tgt_depth > src_depth.max()
-        if np.any(below_src):
+    # u and v are treated independently: one may be present without the other.
+    u_zyx = (_interp_3d(raw["u"], **kw3, fill_value=0.0)
+              if raw["u"] is not None
+              else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+    v_zyx = (_interp_3d(raw["v"], **kw3, fill_value=0.0)
+              if raw["v"] is not None
+              else np.zeros((Nz, Ny, Nx), dtype=np.float32))
+
+    # Zero out levels below the deepest ORAS5 level for fields that came from
+    # data.  Extrapolating bottom velocities downward is physically wrong.
+    below_src = tgt_depth > src_depth.max()
+    if np.any(below_src):
+        if raw["u"] is not None:
             u_zyx[below_src] = 0.0
+        if raw["v"] is not None:
             v_zyx[below_src] = 0.0
-    else:
-        u_zyx = np.zeros((Nz, Ny, Nx), dtype=np.float32)
-        v_zyx = np.zeros((Nz, Ny, Nx), dtype=np.float32)
     eta_yx  = (_interp_2d(raw["eta"], **kw2, fill_value=0.0)
                if raw["eta"] is not None
                else np.zeros((Ny, Nx), dtype=np.float32))
