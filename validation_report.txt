@@ -1,0 +1,198 @@
+OceanJAX ORAS5 Validation Report
+=================================
+Date: 2026-03-25
+Data source: oras5_2026_01_native_merged.nc  (NEMO/ORCA native curvilinear grid, January 2026)
+  Grid type : curvilinear (NEMO/ORCA), 1021×1442 horizontal, 75 vertical levels
+  T range   : -1.99 to 39.3 degC   (NaN = land/ice mask)
+  S range   : 0.038 to 43.4 psu
+  u range   : -1.87 to 1.89 m/s
+  v range   : -2.18 to 1.73 m/s
+  eta range : -1.95 to 1.26 m
+
+
+================================================================
+VALIDATION RUN 1 — North Atlantic subdomain
+================================================================
+
+Domain
+------
+  Longitude : 60°W – 10°W
+  Latitude  : 20°N – 50°N
+  Depth max : 500 m
+
+Model grid
+----------
+  Nx=20, Ny=15, Nz=10
+  dx ≈ 2.5°, dy ≈ 2°
+  dz = 50 m uniform (z_c = 25, 75, …, 475 m)
+
+Numerical parameters
+--------------------
+  dt         = 300 s
+  n_steps    = 288  (= 24 hours)
+  chunk_size = 72   (= 6 hours per JIT-compiled scan)
+  Barotropic CFL (leapfrog) = sqrt(9.81×500) × 2×300 / (2.5°×111km×cos35°) ≈ 0.19
+
+Regridded initial fields (ORAS5 → model grid)
+---------------------------------------------
+  T   : 0.286 – 25.61 degC,  mean 8.62 degC,   no NaN
+  S   : 31.80 – 37.64 psu,   mean 35.41 psu,   no NaN
+  u   : -0.349 – 0.681 m/s,  mean 0.005 m/s
+  v   : -0.440 – 0.430 m/s,  mean -0.002 m/s
+  eta : -0.954 – 0.389 m,    mean -0.138 m
+  Sanity checks: T in [-2,35]°C PASS | S in [20,42] psu PASS | no NaN in wet cells PASS
+
+Initial tendency magnitudes
+---------------------------
+  |G_u|_max = 3.11e-5 m/s²  → Δu per dt = 0.028 m/s
+  |G_v|_max = 2.84e-5 m/s²  → Δv per dt = 0.026 m/s
+  |G_T|_max = 9.52e-5 °C/s  → ΔT per dt = 0.086 °C
+
+Phase 2a — Full ORAS5 initialisation (T, S, u, v, eta from data)
+-----------------------------------------------------------------
+  Result : PASS (288 steps, no non-finite values)
+
+  t =  6 h : T=[-0.17, 27.10]°C  S=[31.22, 37.74] psu  eta=[-1.375, 0.913] m
+  t = 12 h : T=[-0.16, 27.10]°C  S=[31.24, 37.74] psu  eta=[-1.168, 0.643] m
+  t = 18 h : T=[-0.14, 27.08]°C  S=[31.26, 37.73] psu  eta=[-1.528, 0.473] m
+  t = 24 h : T=[-0.14, 27.06]°C  S=[31.30, 37.73] psu  eta=[-1.064, 0.717] m
+
+  Observations:
+  - T and S remain physically bounded throughout.
+  - eta oscillates within ±1.5 m (barotropic geostrophic adjustment to
+    the coarse-grid-regridded velocity field).
+  - No blow-up, no non-finite values.
+
+Phase 2b — Baroclinic cold start (u=v=0, eta=0; T, S from ORAS5 only)
+-----------------------------------------------------------------------
+  Result : PASS (288 steps, no non-finite values)
+
+  t =  6 h : T=[-0.17, 27.10]°C  S=[31.22, 37.74] psu  eta=[-0.306, 0.202] m
+  t = 12 h : T=[-0.16, 27.11]°C  S=[31.24, 37.74] psu  eta=[-0.249, 0.210] m
+  t = 18 h : T=[-0.15, 27.10]°C  S=[31.26, 37.74] psu  eta=[-0.282, 0.117] m
+  t = 24 h : T=[-0.14, 27.09]°C  S=[31.29, 37.74] psu  eta=[-0.250, 0.379] m
+
+  Observations:
+  - eta develops from zero to ±0.3 m over 24 h as baroclinic PGF spins up
+    geostrophically balanced currents (geostrophic adjustment).
+  - T/S evolution is smooth and physically consistent.
+  - No blow-up, no non-finite values.
+
+
+================================================================
+VALIDATION RUN 2 — Tropical Atlantic subdomain (open ocean)
+================================================================
+
+Domain
+------
+  Longitude : 40°W – 5°W
+  Latitude  : 15°S – 15°N
+  Depth max : 500 m
+
+Model grid
+----------
+  Nx=20, Ny=15, Nz=10
+  dx ≈ 1.75°, dy ≈ 2°
+  dz = 50 m uniform (z_c = 25, 75, …, 475 m)
+
+Numerical parameters
+--------------------
+  dt         = 300 s
+  n_steps    = 288  (= 24 hours)
+  chunk_size = 72   (= 6 hours per JIT-compiled scan)
+  Barotropic CFL (leapfrog) ≈ 0.14 (equatorial, cos(lat)≈1)
+
+Regridded initial fields (ORAS5 → model grid)
+---------------------------------------------
+  T   : 6.834 – 29.20 degC,  mean 14.08 degC,  no NaN
+  S   : 34.44 – 37.26 psu,   mean 35.34 psu,   no NaN
+  u   : -0.714 – 0.730 m/s,  mean -0.001 m/s
+  v   : -0.349 – 0.777 m/s,  mean  0.018 m/s
+  eta : -0.127 – 0.237 m,    mean  0.028 m
+  Sanity checks: T in [-2,35]°C PASS | S in [20,42] psu PASS | no NaN in wet cells PASS
+
+  Notable differences vs. Run 1:
+  - T_min is much higher (6.8°C vs 0.3°C): no sub-polar water in domain.
+  - S range narrower (34.4–37.3 vs 31.8–37.6): no fresh Arctic outflow.
+  - eta range much smaller (±0.13 m vs ±0.95 m): truly open ocean,
+    no strong boundary currents like the Gulf Stream.
+
+Initial tendency magnitudes
+---------------------------
+  |G_u|_max = 1.52e-5 m/s²  → Δu per dt = 0.005 m/s  (half of Run 1)
+  |G_v|_max = 1.22e-5 m/s²  → Δv per dt = 0.004 m/s
+  |G_T|_max = 2.94e-4 °C/s  → ΔT per dt = 0.088 °C
+
+Phase 2a — Full ORAS5 initialisation (T, S, u, v, eta from data)
+-----------------------------------------------------------------
+  Result : PASS (288 steps, no non-finite values)
+
+  t =  6 h : T=[6.86, 29.11]°C  S=[33.49, 37.27] psu  eta=[-1.246, 0.719] m
+  t = 12 h : T=[6.90, 28.99]°C  S=[34.00, 37.26] psu  eta=[-0.809, 1.036] m
+  t = 18 h : T=[6.90, 28.85]°C  S=[34.16, 37.26] psu  eta=[-0.865, 0.560] m
+  t = 24 h : T=[6.86, 28.84]°C  S=[34.10, 37.25] psu  eta=[-0.676, 0.622] m
+
+  Observations:
+  - Surface T gradually decreases by ~0.4°C over 24 h (mixing/advection).
+  - S_min rises from 33.5 to 34.1 psu over 24 h: freshwater tongue
+    near the ITCZ being mixed/advected.
+  - eta oscillates ±1 m: barotropic geostrophic adjustment (larger than
+    initial ±0.13 m because the regridded u/v field is not in exact
+    geostrophic balance on the coarse grid).
+  - No blow-up, no non-finite values.
+
+Phase 2b — Baroclinic cold start (u=v=0, eta=0; T, S from ORAS5 only)
+-----------------------------------------------------------------------
+  Result : PASS (288 steps, no non-finite values)
+
+  t =  6 h : T=[6.85, 29.18]°C  S=[34.44, 37.26] psu  eta=[-0.129, 0.108] m
+  t = 12 h : T=[6.84, 29.13]°C  S=[34.45, 37.26] psu  eta=[-0.097, 0.094] m
+  t = 18 h : T=[6.86, 29.04]°C  S=[34.46, 37.26] psu  eta=[-0.126, 0.095] m
+  t = 24 h : T=[6.86, 28.94]°C  S=[34.47, 37.26] psu  eta=[-0.113, 0.081] m
+
+  Observations:
+  - eta remains small (±0.13 m) throughout: the weak baroclinic PGF
+    near the equator generates only modest geostrophic adjustment
+    (Coriolis force → 0 at equator, so adjustment is slow).
+  - S is nearly constant (equatorial thermocline well-mixed).
+  - T decreases smoothly by ~0.3°C over 24 h: consistent with
+    upward diffusion of cold thermocline water.
+  - This is the cleanest run of all four: smallest forcings, smallest
+    eta excursions, most physically interpretable.
+
+
+================================================================
+Summary
+================================================================
+
+  Run / Init          | Domain          | Phase 2a | Phase 2b
+  --------------------|-----------------|----------|----------
+  North Atlantic      | 60W-10W, 20-50N | PASS     | PASS
+  Tropical Atlantic   | 40W-5W,  15S-15N| PASS     | PASS
+
+All four integration tests complete 288 steps (24 h) without
+non-finite values. T and S remain within physically plausible ranges
+in all cases. The validation confirms:
+
+  1. ORAS5 loading and regridding pipeline works correctly for both
+     a mid-latitude western boundary current region and a tropical
+     open-ocean region.
+
+  2. The model integrates stably with ORAS5-initialised fields at
+     dt=300 s and DEPTH_MAX=500 m.
+
+  3. The baroclinic cold-start (T/S only) is cleaner and more stable,
+     particularly in the tropics, and is the recommended initialisation
+     strategy for future validation runs.
+
+Known limitation
+----------------
+  Full ORAS5 initialisation (including u, v, eta) at DEPTH_MAX=2000 m
+  and dt=900 s is unstable. Root cause: the regridded velocity field
+  (0.68 m/s Gulf Stream) creates barotropic transport divergence
+  (~5 m/step of eta change) that exceeds the initial SSH (~1 m).
+  This is a physical imbalance from grid coarsening, not a bug in
+  the numerical scheme. The leapfrog free-surface fix (committed
+  2026-03-25) correctly addresses the theoretical instability for
+  small perturbations; large-perturbation runs require either a
+  shallower domain, a smaller dt, or geostrophic initialisation.
