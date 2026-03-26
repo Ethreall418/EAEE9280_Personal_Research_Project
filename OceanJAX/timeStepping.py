@@ -43,6 +43,19 @@ the momentum equations as a surface-layer tendency analogous to the tracer
 heat / freshwater fluxes.  Passing ``forcing=None`` disables all surface
 inputs (useful for spin-up or idealised experiments).
 
+ML closure hook
+---------------
+An optional ``closure`` argument (``OceanJAX.ml.AbstractClosure``) can be
+passed to ``step()`` and ``run()``.  When supplied, the closure is called
+once per step after the explicit tracer tendencies are computed:
+
+  G_T  +=  corr.dT_tend             (extra T tendency [K s-1])
+  G_S  +=  corr.dS_tend             (extra S tendency [psu s-1])
+  kappa_v_eff = kappa_v * corr.kappa_v_scale   (vertical diffusivity scaling)
+
+Passing ``closure=None`` (the default) skips the hook entirely; the
+numerical path is bit-identical to the pre-ML pure-physics version.
+
 Contents
 --------
   SurfaceForcing    – equinox Module holding surface flux fields
@@ -60,6 +73,7 @@ import equinox as eqx
 
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import OceanState, ModelParams
+from OceanJAX.ml.closure import AbstractClosure
 from OceanJAX.Physics.dynamics import (
     equation_of_state,
     hydrostatic_pressure,
@@ -174,6 +188,7 @@ def step(
     grid:    OceanGrid,
     params:  ModelParams,
     forcing: Optional[SurfaceForcing] = None,
+    closure: Optional[AbstractClosure] = None,
 ) -> OceanState:
     """
     Advance the model state by one time step dt.
@@ -189,6 +204,7 @@ def step(
     5.  Implicit vertical viscosity applied to u_new, v_new.
     6.  Explicit tracer tendencies (advection + horiz. diffusion).
         + Heat flux / freshwater surface forcing (if supplied).
+        [ML hook] closure corrections to G_T, G_S and kappa_v (if supplied).
     7.  Adams-Bashforth 3 tracer advance.
     8.  Implicit vertical diffusion applied to T_new, S_new.
     9.  Free-surface update: eta_new = eta + dt * deta_dt
@@ -200,6 +216,12 @@ def step(
         grid    : OceanGrid (static)
         params  : ModelParams
         forcing : SurfaceForcing for this time step, or None
+        closure : AbstractClosure instance, or None.
+                  When supplied, called after the explicit tracer tendencies
+                  to add learnable corrections (dT_tend, dS_tend) and to
+                  scale the vertical diffusivity (kappa_v_scale).
+                  Passing None (default) skips the hook entirely; the
+                  numerical path is bit-identical to the pure-physics version.
 
     Returns:
         OceanState at time n+1
@@ -261,6 +283,19 @@ def step(
         G_S = G_S + salt_surface_tendency(forcing.fw_flux,   grid, params)
 
     # ------------------------------------------------------------------
+    # [ML hook] Closure corrections to tracer tendencies and kappa_v.
+    #   Activated only when closure is not None; closure=None (default)
+    #   leaves G_T, G_S, and kappa_v completely unchanged.
+    # ------------------------------------------------------------------
+    if closure is not None:
+        corr    = closure(state, grid, params)
+        G_T     = (G_T + corr.dT_tend) * grid.mask_c
+        G_S     = (G_S + corr.dS_tend) * grid.mask_c
+        kappa_v = params.kappa_v * corr.kappa_v_scale
+    else:
+        kappa_v = params.kappa_v
+
+    # ------------------------------------------------------------------
     # 7. Adams-Bashforth 3 tracer advance
     #    Select coefficients based on step_count for proper bootstrap:
     #      step_count == 0  →  AB1: (1,    0,    0  )
@@ -281,10 +316,12 @@ def step(
 
     # ------------------------------------------------------------------
     # 8. Implicit vertical diffusion
+    #    kappa_v is either params.kappa_v (pure physics) or
+    #    params.kappa_v * corr.kappa_v_scale (when closure is active).
     # ------------------------------------------------------------------
-    T_new = implicit_vertical_mix(T_new, params.kappa_v, dt, grid,
+    T_new = implicit_vertical_mix(T_new, kappa_v, dt, grid,
                                   rhs_explicit=jnp.zeros_like(T_new))
-    S_new = implicit_vertical_mix(S_new, params.kappa_v, dt, grid,
+    S_new = implicit_vertical_mix(S_new, kappa_v, dt, grid,
                                   rhs_explicit=jnp.zeros_like(S_new))
 
     # ------------------------------------------------------------------
@@ -344,6 +381,7 @@ def run(
     n_steps:          int,
     forcing_sequence: Optional[SurfaceForcing] = None,
     save_history:     bool = False,
+    closure:          Optional[AbstractClosure] = None,
 ) -> tuple[OceanState, Optional[OceanState]]:
     """
     Integrate the model for ``n_steps`` time steps using ``jax.lax.scan``.
@@ -365,6 +403,9 @@ def run(
                            snapshots (memory-intensive for long runs).
                            If False, only the final state is returned and
                            history is None.
+        closure          : AbstractClosure instance, or None.
+                           Passed through to every call to ``step()``.
+                           See ``step()`` for details.
 
     Returns:
         (final_state, history)
@@ -373,7 +414,7 @@ def run(
                       if save_history=True, else None.
     """
     def _step_fn(carry: OceanState, forcing_t: Optional[SurfaceForcing]):
-        new_state = step(carry, grid, params, forcing_t)
+        new_state = step(carry, grid, params, forcing_t, closure)
         output    = new_state if save_history else None
         return new_state, output
 

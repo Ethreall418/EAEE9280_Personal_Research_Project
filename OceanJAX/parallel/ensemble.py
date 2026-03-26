@@ -40,6 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from OceanJAX.grid import OceanGrid
 from OceanJAX.state import OceanState, ModelParams
 from OceanJAX.timeStepping import step, run, SurfaceForcing
+from OceanJAX.ml.closure import AbstractClosure
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +52,14 @@ def batch_step(
     grid:    OceanGrid,
     params:  ModelParams,
     forcing: Optional[SurfaceForcing] = None,
+    closure: Optional[AbstractClosure] = None,
 ) -> OceanState:
     """
     Advance a batch of independent ocean states by one time step.
 
     Uses ``eqx.filter_vmap`` to vectorise ``step()`` over the leading batch
-    axis B of ``states``.  ``grid`` and ``params`` are shared across all
-    ensemble members (not batched).
+    axis B of ``states``.  ``grid``, ``params``, and ``closure`` are shared
+    across all ensemble members (not batched).
 
     Parameters
     ----------
@@ -67,6 +69,9 @@ def batch_step(
     params  : ModelParams — replicated, same for all members.
     forcing : SurfaceForcing with a leading batch axis B (same B as states),
               or None for no surface forcing.
+    closure : AbstractClosure instance, or None.
+              The same closure is applied to every ensemble member.
+              Passing None (default) skips the ML hook.
 
     Returns
     -------
@@ -74,10 +79,10 @@ def batch_step(
     """
     if forcing is None:
         return eqx.filter_vmap(
-            lambda s: step(s, grid, params, None)
+            lambda s: step(s, grid, params, None, closure)
         )(states)
     return eqx.filter_vmap(
-        lambda s, f: step(s, grid, params, f),
+        lambda s, f: step(s, grid, params, f, closure),
         in_axes=(0, 0),
     )(states, forcing)
 
@@ -93,6 +98,7 @@ def batch_run(
     n_steps:          int,
     forcing_sequence: Optional[SurfaceForcing] = None,
     save_history:     bool = False,
+    closure:          Optional[AbstractClosure] = None,
 ) -> tuple[OceanState, Optional[OceanState]]:
     """
     Run a batch of independent ocean simulations for ``n_steps`` steps.
@@ -110,6 +116,8 @@ def batch_run(
                        ``(B, n_steps, Nx, Ny)``, or None.
     save_history     : If True, return all intermediate states (memory-
                        intensive for large B × n_steps).
+    closure          : AbstractClosure instance, or None.
+                       Shared across all ensemble members and time steps.
 
     Returns
     -------
@@ -120,10 +128,10 @@ def batch_run(
     """
     if forcing_sequence is None:
         return eqx.filter_vmap(
-            lambda s: run(s, grid, params, n_steps, None, save_history)
+            lambda s: run(s, grid, params, n_steps, None, save_history, closure)
         )(states)
     return eqx.filter_vmap(
-        lambda s, f: run(s, grid, params, n_steps, f, save_history),
+        lambda s, f: run(s, grid, params, n_steps, f, save_history, closure),
         in_axes=(0, 0),
     )(states, forcing_sequence)
 
@@ -140,6 +148,7 @@ def sharded_ensemble_run(
     forcing_sequence: Optional[SurfaceForcing] = None,
     save_history:     bool = False,
     devices:          Optional[list] = None,
+    closure:          Optional[AbstractClosure] = None,
 ) -> tuple[OceanState, Optional[OceanState]]:
     """
     Run an ensemble batch distributed across multiple GPUs.
@@ -189,9 +198,9 @@ def sharded_ensemble_run(
             f"devices ({n_devices}).  Reduce N_ENSEMBLE or pass a device subset."
         )
 
-    # JIT-compiled inner function — grid/params captured, not traced per call
+    # JIT-compiled inner function — grid/params/closure captured, not traced per call
     run_fn = jax.jit(
-        lambda s, f: batch_run(s, grid, params, n_steps, f, save_history)
+        lambda s, f: batch_run(s, grid, params, n_steps, f, save_history, closure)
     )
 
     if n_devices == 1:

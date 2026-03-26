@@ -61,7 +61,12 @@ N_DAYS = 30                   # total simulation length in days
 #   TAU_X      [N m-2]  zonal wind stress        (positive = eastward)
 #   TAU_Y      [N m-2]  meridional wind stress   (positive = northward)
 
-FORCING_SOURCE = None                                  # or path to NetCDF file
+FORCING_SOURCE = [                                     # list of per-field ORAS5 files
+    "OceanJAX/data/data_oras5/sohefldo_control_monthly_highres_2D_202601_OPER_v0.1.nc",
+    "OceanJAX/data/data_oras5/sowaflup_control_monthly_highres_2D_202601_OPER_v0.1.nc",
+    "OceanJAX/data/data_oras5/sozotaux_control_monthly_highres_2D_202601_OPER_v0.1.nc",
+    "OceanJAX/data/data_oras5/sometauy_control_monthly_highres_2D_202601_OPER_v0.1.nc",
+]
 FORCING_FIELDS = {"heat_flux", "fw_flux", "tau_x", "tau_y"}
 HEAT_FLUX = 0.0
 FW_FLUX   = 0.0
@@ -91,7 +96,7 @@ N_ENSEMBLE        = 1      # number of ensemble members (1 = single run)
 ENSEMBLE_PERTURB_T = 0.0   # Gaussian T perturbation std [°C] for each member
 
 # --- Output -------------------------------------------------------------------
-OUTPUT_NC     = "output.nc"
+OUTPUT_NC     = "output_cold_full_forcing.nc"
 SAVE_INTERVAL = 288   # steps between NetCDF snapshots  (288 × 300 s = 1 day)
 CHUNK_SIZE    = 288   # steps per JIT-compiled scan call
 

@@ -965,20 +965,23 @@ FORCING_FIELDS: frozenset[str] = frozenset({"heat_flux", "fw_flux", "tau_x", "ta
 
 
 def read_oras5_forcing(
-    path:       str | Path,
+    path:       str | Path | list,
     time_index: int = 0,
 ) -> dict[str, Optional[np.ndarray]]:
     """
-    Read surface-forcing fields from an ORAS5 (or ERA5 / NEMO-flux) NetCDF file.
+    Read surface-forcing fields from one or more ORAS5 NetCDF files.
 
-    All four forcing fields are optional.  If a variable is absent from the
-    file its key is set to ``None`` rather than raising an error — the caller
-    can decide how to handle missing fields.
+    All four forcing fields are optional.  If a variable is absent from
+    every supplied file its key is set to ``None`` rather than raising an
+    error — the caller can decide how to handle missing fields.
 
     Parameters
     ----------
-    path       : NetCDF file that may contain any subset of the four forcing
-                 variables (see :data:`FORCING_FIELDS`).
+    path       : A single NetCDF file path, or a list of paths.
+                 When a list is given every file is searched; later files
+                 in the list take precedence if the same field appears in
+                 multiple files.  Coordinates (lon/lat) are taken from the
+                 first file that contains them.
     time_index : Index along the time dimension to read (default 0).
 
     Returns
@@ -1000,37 +1003,67 @@ def read_oras5_forcing(
     model convention.  ``sowaflup`` is positive upward (evaporation > 0), also
     consistent.  Wind-stress sign conventions vary by product — check the
     source file metadata if in doubt.
+
+    Unit conversion
+    ---------------
+    ``fw_flux`` is expected by the model in **m s-1** (volume flux per unit
+    area).  ORAS5 ``sowaflup`` is stored in **kg m-2 s-1** (mass flux).
+    This function detects the mass-flux unit and converts automatically by
+    dividing by the freshwater density 1000 kg m-3.
+    ``heat_flux`` (W m-2), ``tau_x``, and ``tau_y`` (N m-2) require no
+    conversion and are returned as-is.
     """
-    ds = xr.open_dataset(path, mask_and_scale=True)
-    try:
-        lon_name = _find_coord(ds, "lon")
-        lat_name = _find_coord(ds, "lat")
+    # Freshwater density for mass-flux → volume-flux conversion [kg m-3]
+    _RHO_FRESHWATER: float = 1000.0
+    # Unit strings that indicate kg/(m^2 s); case-insensitive comparison below
+    _MASS_FLUX_UNITS = {"kg/m2/s", "kg m-2 s-1", "kg/(m2 s)", "kg/m**2/s"}
 
-        lon = np.asarray(ds[lon_name].values, dtype=np.float64)
-        lat = np.asarray(ds[lat_name].values, dtype=np.float64)
+    paths = path if isinstance(path, list) else [path]
 
-        result: dict[str, Optional[np.ndarray]] = {"lon": lon, "lat": lat}
+    result: dict[str, Optional[np.ndarray]] = {
+        "lon": None, "lat": None,
+        "heat_flux": None, "fw_flux": None, "tau_x": None, "tau_y": None,
+    }
 
-        for key in ("heat_flux", "fw_flux", "tau_x", "tau_y"):
-            vname = _find_var(ds, key, optional=True)
-            if vname is None:
-                result[key] = None
-                continue
+    for p in paths:
+        ds = xr.open_dataset(p, mask_and_scale=True)
+        try:
+            # Coordinates: take from the first file that has them
+            if result["lon"] is None:
+                try:
+                    lon_name = _find_coord(ds, "lon")
+                    lat_name = _find_coord(ds, "lat")
+                    result["lon"] = np.asarray(ds[lon_name].values, dtype=np.float64)
+                    result["lat"] = np.asarray(ds[lat_name].values, dtype=np.float64)
+                except KeyError:
+                    pass
 
-            da = ds[vname]
-            # Slice time dimension if present
-            time_dims = [d for d in da.dims
-                         if d in {"time", "time_counter", "t"}]
-            if time_dims:
-                da = da.isel({time_dims[0]: time_index})
+            for key in ("heat_flux", "fw_flux", "tau_x", "tau_y"):
+                vname = _find_var(ds, key, optional=True)
+                if vname is None:
+                    continue
 
-            arr = np.asarray(da.values, dtype=np.float32)
-            # Replace fill values / masked values with NaN
-            arr = np.where(np.isfinite(arr), arr, np.nan)
-            result[key] = arr
+                da = ds[vname]
+                time_dims = [d for d in da.dims
+                             if d in {"time", "time_counter", "t"}]
+                if time_dims:
+                    da = da.isel({time_dims[0]: time_index})
 
-    finally:
-        ds.close()
+                arr = np.asarray(da.values, dtype=np.float32)
+                arr = np.where(np.isfinite(arr), arr, np.nan)
+
+                # Unit conversion for freshwater flux: kg/(m^2 s) → m/s
+                if key == "fw_flux":
+                    units_str = str(da.attrs.get("units", "")).lower().replace(" ", "")
+                    # Normalise common separators for robust matching
+                    units_norm = units_str.replace("**", "").replace("^", "")
+                    if any(u.replace(" ", "") in units_norm
+                           for u in _MASS_FLUX_UNITS):
+                        arr = arr / _RHO_FRESHWATER
+
+                result[key] = arr  # later file overrides earlier
+        finally:
+            ds.close()
 
     return result
 
@@ -1065,6 +1098,7 @@ def regrid_forcing(
 
     src_lon = raw_forcing["lon"]
     src_lat = raw_forcing["lat"]
+
     tgt_lon = np.asarray(grid.lon_c)
     tgt_lat = np.asarray(grid.lat_c)
 
